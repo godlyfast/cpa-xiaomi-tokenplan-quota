@@ -1,8 +1,8 @@
 # Xiaomi Token Plan quota for CLIProxyAPI
 
-An unofficial **Singapore Xiaomi MiMo Token Plan Credits** collector and a **native CLIProxyAPI plugin**. No inference requests, gateway fork, arbitrary upstream proxy, or browser automation service.
+An unofficial **Singapore Xiaomi MiMo Token Plan Credits** collector and a **native CLIProxyAPI plugin**. No inference requests, arbitrary upstream proxy, or browser automation service.
 
-**v0.2.0: native plugin, stock dashboard.** It registers under Plugins and supplies its own authenticated quota page plus native quota-provider API. See [native build, tests, installation and rollback](native/README.md). The former v0.1.0 dashboard source patch remains in this repository for legacy users; it is **not required** by the native plugin.
+**v0.2.1: native plugin with optional dashboard login reuse.** It registers under Plugins and supplies its own authenticated quota page plus native quota-provider API. Build the optional `build:login-panel` variant to reuse an existing dashboard login without passing the management key to the iframe or storing another copy. An unchanged stock panel still supports explicit manual login. See [login bridge design](docs/dashboard-login-bridge.md) and [native build, tests, installation and rollback](native/README.md). The former v0.1.0 Xiaomi-card patch remains separate and is **not applied** by the login-bridge build.
 
 The collector was operator-approved and live-validated on the intended Singapore account; the native implementation has separate unit/race and real-gateway synthetic tests. Installation still requires explicit account binding, protected session provisioning, an isolated gateway/collector network and deployment approval. The console API is undocumented and can change.
 
@@ -10,7 +10,7 @@ The collector was operator-approved and live-validated on the intended Singapore
 
 No ready-to-install Xiaomi quota plugin compatible with the pinned official dashboard was verified. Public implementations found during research used console-session authentication, not a supported inference-key quota API. Read-only discovery of the Singapore console confirmed `GET /api/v1/tokenPlan/usage` and `/detail`; removing browser credentials returned 401. This does **not** establish the minimum cookie recipe, cookie lifetime, replay viability, or which CPA key belongs to the console account.
 
-The vendor session stays in an owner-only file in the collector. The native plugin reads its configurable private collector URL without forwarding any credentials; the stock dashboard loads only the plugin resource shell. Because resource pages do not inherit the panel's login, the plugin page asks for the CPA management key and retains it only in page memory. Quota data is served through a host-authenticated plugin management route, never the public resource route. See [native architecture](native/README.md#architecture-and-authentication).
+The vendor session stays in an owner-only file in the collector. The native plugin reads its configurable private collector URL without forwarding any credentials; the stock dashboard loads only the plugin resource shell. The optional same-origin dashboard bridge performs only the mounted plugin's snapshot GET using the dashboard's existing authenticated client and returns quota, never the key. Without that bridge, the standalone page asks for the CPA management key and retains it only in page memory. Quota data is served through a host-authenticated plugin management route, never the public resource route. See [native architecture](native/README.md#architecture-and-authentication).
 
 For **legacy v0.1.0 only**, the patched dashboard sends:
 
@@ -36,7 +36,7 @@ Credits are not raw tokens, requests, dollars, PAYG balance, or CPA-observed usa
 
 ## Collector and legacy panel build/test
 
-For the current native plugin, follow [native build/test](native/README.md#buildtest); no patched panel build is necessary.
+For the current native plugin, follow [native build/test](native/README.md#buildtest). For automatic dashboard login reuse run `bun run build:login-panel`; it applies only the scoped read-only snapshot bridge, not the legacy quota-card patch. No custom panel is needed for manual login.
 
 Requires Git and **Bun 1.3.14**. Node-compatible tooling can run TypeScript's CLI via the pinned toolchain. No production dependencies.
 
@@ -78,6 +78,6 @@ The collector immediately polls once and then every 300 seconds, with no overlap
 
 - Official panel **v1.26.7**: `714de0760a3ce86094b178fb46f834d34bc4a2a5`.
 - Unmodified backend **v8.0.44**: `1f917e77c4562623aa49e9804d999524151a2f96`.
-- v0.2.0 is a native C ABI plugin plus sidecar; the stock panel is unchanged. The previous source patch is legacy only. Future panel/gateway versions require compatibility review.
+- v0.2.1 is a native C ABI plugin plus sidecar. Its optional custom-panel variant adds only a read-only same-origin snapshot bridge; the stock-panel manual fallback remains. The v0.1.0 quota-card source patch is legacy only. Future panel/gateway versions require compatibility review.
 - Synthetic fixtures only. No live vendor session, inference key, management key, user ID or captured account balance is shipped.
 - MIT; preserve [third-party notices](THIRD_PARTY_NOTICES.md). No Xiaomi endorsement or warranty.

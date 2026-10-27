@@ -35,7 +35,7 @@ def run():
     threading.Thread(target=collector.serve_forever, daemon=True).start()
     with tempfile.TemporaryDirectory(prefix='xiaomi-native-proof-') as tmp:
         root = Path(tmp); (root/'auth').mkdir(); (root/'plugins').mkdir()
-        shutil.copy(library, root/'plugins'/'xiaomi-tokenplan-quota-v0.2.0.so')
+        shutil.copy(library, root/'plugins'/library.name)
         with socket.socket() as s: s.bind(('127.0.0.1', 0)); port = s.getsockname()[1]
         base = f'http://127.0.0.1:{port}'
         def request(path, data=None, auth=True):

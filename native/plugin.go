@@ -19,7 +19,7 @@ import (
 )
 
 const pluginID = "xiaomi-tokenplan-quota"
-const version = "0.2.0"
+const version = "0.2.1"
 const maxSnapshot = 32768
 const snapshotPath = "/v0/management/plugins/" + pluginID + "/snapshot"
 const resourcePath = "/v0/resource/plugins/" + pluginID + "/quota"

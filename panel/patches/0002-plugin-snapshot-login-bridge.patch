@@ -1,0 +1,405 @@
+diff --git a/src/features/plugins/PluginResourcePage.tsx b/src/features/plugins/PluginResourcePage.tsx
+index 051f035..0a053f8 100644
+--- a/src/features/plugins/PluginResourcePage.tsx
++++ b/src/features/plugins/PluginResourcePage.tsx
+@@ -1,9 +1,12 @@
+-import { useCallback, useEffect, useMemo, useState } from 'react';
++import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+ import { useParams } from 'react-router-dom';
+ import { useTranslation } from 'react-i18next';
+ import { EmptyState } from '@/components/ui/EmptyState';
+ import { useHeaderRefresh } from '@/hooks/useHeaderRefresh';
+ import { pluginsApi } from '@/services/api';
++import { apiClient } from '@/services/api/client';
++import { capturePluginSnapshotReader } from '@/services/api/pluginSnapshot';
++import { createPluginSnapshotBridge } from './pluginSnapshotBridge';
+ import { useAuthStore } from '@/stores';
+ import { getErrorMessage, isRecord } from '@/utils/helpers';
+ import type { PluginListResponse } from '@/types';
+@@ -34,6 +37,9 @@ export function PluginResourcePage() {
+   const params = useParams<{ pluginId: string; menuIndex: string }>();
+   const connectionStatus = useAuthStore((state) => state.connectionStatus);
+   const apiBase = useAuthStore((state) => state.apiBase);
++  const managementKey = useAuthStore((state) => state.managementKey);
++  const iframeRef = useRef<HTMLIFrameElement>(null);
++  const [frameGeneration, setFrameGeneration] = useState(0);
+ 
+   const [data, setData] = useState<PluginListResponse | null>(null);
+   const [loading, setLoading] = useState(true);
+@@ -87,6 +93,45 @@ export function PluginResourcePage() {
+ 
+   const iframeSrc = resource ? resolvePluginAssetURL(resource.menu.path, apiBase) : '';
+ 
++  useEffect(() => {
++    if (!connected || loading || error || !iframeSrc) return;
++    const controller = new AbortController();
++    const readSnapshot = capturePluginSnapshotReader(
++      pluginID,
++      apiBase,
++      iframeSrc,
++      window.location.origin,
++      controller.signal
++    );
++    if (!readSnapshot) return;
++    const revision = apiClient.getConnectionRevision();
++    const bridge = createPluginSnapshotBridge({
++      origin: window.location.origin,
++      frame: () => iframeRef.current?.contentWindow ?? null,
++      document: () => {
++        try {
++          const document = iframeRef.current?.contentDocument;
++          return document?.URL === iframeSrc ? document : null;
++        } catch {
++          return null;
++        }
++      },
++      readSnapshot,
++      current: () =>
++        useAuthStore.getState().connectionStatus === 'connected' &&
++        apiClient.getConnectionRevision() === revision,
++    });
++    const receive = (event: MessageEvent) => {
++      void bridge.receive(event);
++    };
++    window.addEventListener('message', receive);
++    return () => {
++      bridge.dispose();
++      controller.abort();
++      window.removeEventListener('message', receive);
++    };
++  }, [connected, apiBase, managementKey, pluginID, iframeSrc, loading, error, frameGeneration]);
++
+   return (
+     <div className={styles.page}>
+       {loading ? (
+@@ -113,6 +158,8 @@ export function PluginResourcePage() {
+         </div>
+       ) : (
+         <iframe
++          ref={iframeRef}
++          onLoad={() => setFrameGeneration((value) => value + 1)}
+           className={styles.frame}
+           src={iframeSrc}
+           title={resource.label}
+diff --git a/src/features/plugins/pluginSnapshotBridge.ts b/src/features/plugins/pluginSnapshotBridge.ts
+new file mode 100644
+index 0000000..5a1cde4
+--- /dev/null
++++ b/src/features/plugins/pluginSnapshotBridge.ts
+@@ -0,0 +1,60 @@
++type Options = {
++  origin: string;
++  frame: () => Window | null;
++  document: () => Document | null;
++  readSnapshot: () => Promise<unknown>;
++  current: () => boolean;
++};
++
++/** Read-only, same-origin capability for the currently mounted plugin frame. */
++export function createPluginSnapshotBridge(options: Options) {
++  let disposed = false;
++  let pending = false;
++  const document = options.document();
++  const valid = (source: MessageEventSource | null) =>
++    !disposed &&
++    options.current() &&
++    document !== null &&
++    options.document() === document &&
++    source !== null &&
++    source === options.frame();
++
++  return {
++    async receive(event: MessageEvent) {
++      const data: unknown = event.data;
++      if (
++        pending ||
++        event.origin !== options.origin ||
++        !valid(event.source) ||
++        !data ||
++        typeof data !== 'object' ||
++        Array.isArray(data)
++      )
++        return;
++      const request = data as Record<string, unknown>;
++      if (
++        Object.keys(request).length !== 2 ||
++        request.type !== 'cpa.plugin.snapshot.request.v1' ||
++        typeof request.requestId !== 'string' ||
++        !/^[A-Za-z0-9-]{1,64}$/.test(request.requestId)
++      )
++        return;
++      pending = true;
++      const response: Record<string, unknown> = {
++        type: 'cpa.plugin.snapshot.response.v1',
++        requestId: request.requestId,
++      };
++      try {
++        response.snapshot = await options.readSnapshot();
++      } catch {
++        response.error = 'unavailable';
++      } finally {
++        pending = false;
++      }
++      if (valid(event.source)) options.frame()?.postMessage(response, options.origin);
++    },
++    dispose() {
++      disposed = true;
++    },
++  };
++}
+diff --git a/src/services/api/pluginSnapshot.ts b/src/services/api/pluginSnapshot.ts
+new file mode 100644
+index 0000000..09886ad
+--- /dev/null
++++ b/src/services/api/pluginSnapshot.ts
+@@ -0,0 +1,30 @@
++import { apiClient } from './client';
++
++/** Explicit plugin extension; never a general-purpose management request proxy. */
++export function capturePluginSnapshotReader(
++  pluginID: string,
++  apiBase: string,
++  resourceURL: string,
++  panelOrigin: string,
++  signal: AbortSignal
++): (() => Promise<unknown>) | null {
++  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(pluginID)) return null;
++  try {
++    const resource = new URL(resourceURL);
++    const api = new URL(apiBase);
++    const namespace = encodeURIComponent(pluginID);
++    if (
++      api.origin !== panelOrigin ||
++      resource.origin !== panelOrigin ||
++      resource.username ||
++      resource.password ||
++      !resource.pathname.startsWith(`/v0/resource/plugins/${namespace}/`)
++    )
++      return null;
++    const url = new URL(`/v0/management/plugins/${namespace}/snapshot`, panelOrigin).href;
++    const client = apiClient.captureConnection();
++    return () => client.get(url, { signal, timeout: 5000 });
++  } catch {
++    return null;
++  }
++}
+diff --git a/tests/pluginSnapshotApi.test.ts b/tests/pluginSnapshotApi.test.ts
+new file mode 100644
+index 0000000..f3ce60c
+--- /dev/null
++++ b/tests/pluginSnapshotApi.test.ts
+@@ -0,0 +1,56 @@
++import { expect, test } from 'bun:test';
++import { apiClient } from '../src/services/api/client';
++import { capturePluginSnapshotReader } from '../src/services/api/pluginSnapshot';
++
++test('reads only the active plugin snapshot using captured dashboard authentication', async () => {
++  const requests: { path: string; method: string; authorization: string | null }[] = [];
++  const server = Bun.serve({
++    hostname: '127.0.0.1',
++    port: 0,
++    fetch(req) {
++      requests.push({
++        path: new URL(req.url).pathname,
++        method: req.method,
++        authorization: req.headers.get('authorization'),
++      });
++      return Response.json({ remaining: '40' });
++    },
++  });
++  const origin = server.url.origin;
++  try {
++    apiClient.setConfig({ apiBase: origin, managementKey: 'synthetic-only' });
++    const read = capturePluginSnapshotReader(
++      'plugin-a',
++      origin,
++      origin + '/v0/resource/plugins/plugin-a/quota',
++      origin,
++      new AbortController().signal
++    );
++    expect(read).not.toBeNull();
++    // A new dashboard session must not silently retarget an already captured reader.
++    apiClient.setConfig({ apiBase: origin, managementKey: 'synthetic-new-account' });
++    expect(await read!()).toEqual({ remaining: '40' });
++    expect(requests).toEqual([
++      {
++        path: '/v0/management/plugins/plugin-a/snapshot',
++        method: 'GET',
++        authorization: 'Bearer synthetic-only',
++      },
++    ]);
++  } finally {
++    apiClient.setConfig({ apiBase: '', managementKey: '' });
++    server.stop(true);
++  }
++});
++test('does not grant a reader to foreign or mismatched plugin resources', () => {
++  const origin = 'https://panel.invalid';
++  const signal = new AbortController().signal;
++  for (const [id, api, resource] of [
++    ['plugin-a', origin, 'https://other.invalid/v0/resource/plugins/plugin-a/quota'],
++    ['plugin-a', 'https://other.invalid', origin + '/v0/resource/plugins/plugin-a/quota'],
++    ['plugin-a', origin, origin + '/v0/resource/plugins/plugin-b/quota'],
++    ['../config', origin, origin + '/v0/resource/plugins/plugin-a/quota'],
++    ['plugin-a', origin, 'not-a-url'],
++  ])
++    expect(capturePluginSnapshotReader(id, api, resource, origin, signal)).toBeNull();
++});
+diff --git a/tests/pluginSnapshotBridge.test.ts b/tests/pluginSnapshotBridge.test.ts
+new file mode 100644
+index 0000000..71d5bb7
+--- /dev/null
++++ b/tests/pluginSnapshotBridge.test.ts
+@@ -0,0 +1,152 @@
++import { expect, test } from 'bun:test';
++import { createPluginSnapshotBridge } from '../src/features/plugins/pluginSnapshotBridge';
++
++const origin = 'http://127.0.0.1:8317';
++const request = { type: 'cpa.plugin.snapshot.request.v1', requestId: 'request-1' };
++function harness(readSnapshot: () => Promise<unknown> = async () => ({ remaining: '40' })) {
++  const replies: unknown[] = [];
++  const frame = {
++    postMessage: (data: unknown, target: string) => replies.push({ data, target }),
++  } as unknown as Window;
++  let active = true;
++  let document = {} as Document;
++  const bridge = createPluginSnapshotBridge({
++    origin,
++    frame: () => frame,
++    document: () => document,
++    readSnapshot,
++    current: () => active,
++  });
++  const receive = (data: unknown = request, source: unknown = frame, from = origin) =>
++    bridge.receive({ data, source, origin: from } as MessageEvent);
++  return {
++    replies,
++    frame,
++    bridge,
++    receive,
++    invalidate: () => {
++      active = false;
++    },
++    navigate: () => {
++      document = {} as Document;
++    },
++  };
++}
++
++test('only the current same-origin frame receives quota, never credentials', async () => {
++  const h = harness();
++  await h.receive();
++  expect(h.replies).toEqual([
++    {
++      data: {
++        type: 'cpa.plugin.snapshot.response.v1',
++        requestId: 'request-1',
++        snapshot: { remaining: '40' },
++      },
++      target: origin,
++    },
++  ]);
++});
++test('spoofed origins and window sources cannot read or receive quota', async () => {
++  let reads = 0;
++  const h = harness(async () => {
++    reads++;
++    return {};
++  });
++  await h.receive(request, h.frame, 'https://attacker.invalid');
++  await h.receive(request, {});
++  expect(reads).toBe(0);
++  expect(h.replies).toHaveLength(0);
++});
++test('arbitrary URLs, methods, unbounded IDs and unknown operations are rejected', async () => {
++  let reads = 0;
++  const h = harness(async () => {
++    reads++;
++    return {};
++  });
++  for (const data of [
++    null,
++    { ...request, url: '/config' },
++    { ...request, method: 'POST' },
++    { ...request, requestId: 'x'.repeat(65) },
++    { ...request, requestId: '' },
++    { ...request, type: 'delete' },
++  ])
++    await h.receive(data);
++  expect(reads).toBe(0);
++  expect(h.replies).toHaveLength(0);
++});
++test('logout or connection changes prevent deferred quota from escaping', async () => {
++  let resolve!: (value: unknown) => void;
++  const h = harness(
++    () =>
++      new Promise((r) => {
++        resolve = r;
++      })
++  );
++  const pending = h.receive();
++  h.invalidate();
++  resolve({ private: 'old account' });
++  await pending;
++  expect(h.replies).toHaveLength(0);
++});
++test('same WindowProxy navigation invalidates reads and deferred responses', async () => {
++  let resolve!: (value: unknown) => void;
++  let reads = 0;
++  const h = harness(() => {
++    reads++;
++    return new Promise((r) => {
++      resolve = r;
++    });
++  });
++  const pending = h.receive();
++  h.navigate();
++  resolve({ private: 'previous document' });
++  await pending;
++  expect(h.replies).toHaveLength(0);
++  await h.receive();
++  expect(reads).toBe(1);
++});
++
++test('disposal prevents deferred quota and further reads', async () => {
++  let resolve!: (value: unknown) => void;
++  let reads = 0;
++  const h = harness(() => {
++    reads++;
++    return new Promise((r) => {
++      resolve = r;
++    });
++  });
++  const pending = h.receive();
++  h.bridge.dispose();
++  resolve({ private: 'old page' });
++  await pending;
++  await h.receive();
++  expect(h.replies).toHaveLength(0);
++  expect(reads).toBe(1);
++});
++test('only one quota read may be in flight and raw errors are redacted', async () => {
++  let reject!: (value: unknown) => void;
++  let reads = 0;
++  const h = harness(() => {
++    reads++;
++    return new Promise((_, r) => {
++      reject = r;
++    });
++  });
++  const pending = h.receive();
++  await h.receive();
++  reject(Error('Bearer synthetic-secret / internal-url'));
++  await pending;
++  expect(reads).toBe(1);
++  expect(h.replies).toEqual([
++    {
++      data: {
++        type: 'cpa.plugin.snapshot.response.v1',
++        requestId: 'request-1',
++        error: 'unavailable',
++      },
++      target: origin,
++    },
++  ]);
++});

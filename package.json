@@ -10,6 +10,7 @@
     "type-check": "tsc --noEmit",
     "build": "bun build --target bun src/main.ts --outdir dist",
     "build:panel": "bun scripts/build-panel.ts",
+    "build:login-panel": "bun scripts/build-panel.ts --login-bridge",
     "verify": "bun test && bun run type-check && bun run build"
   },
   "devDependencies": {

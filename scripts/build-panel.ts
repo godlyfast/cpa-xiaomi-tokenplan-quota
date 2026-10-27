@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 if (Bun.version !== "1.3.14")
   throw new Error("Run with Bun 1.3.14 (packageManager pin).");
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const loginBridge = process.argv.includes("--login-bridge");
 const pins = await Bun.file(join(root, "upstream.json")).json();
 await mkdir(join(root, ".build"), { recursive: true });
 const work = await mkdtemp(join(root, ".build", "panel-"));
@@ -16,7 +17,7 @@ const cleanEnv = {
   LANG: "C.UTF-8",
   TZ: "UTC",
   CI: "true",
-  VERSION: "v1.26.7-xiaomi.0.1.0",
+  VERSION: loginBridge ? "v1.26.7-login.0.2.1" : "v1.26.7-xiaomi.0.1.0",
 };
 async function run(name: string, cmd: string[], allowedFailure = false) {
   const result = Bun.spawnSync(cmd, {
@@ -70,7 +71,9 @@ if (
 await run("baseline-lint", [process.execPath, "run", "lint"]);
 await run("baseline-types", [process.execPath, "run", "type-check"]);
 await run("baseline-build", [process.execPath, "run", "build"]);
-const patch = join(root, "panel/patches/0001-xiaomi-quota.patch");
+const patch = join(root, loginBridge
+  ? "panel/patches/0002-plugin-snapshot-login-bridge.patch"
+  : "panel/patches/0001-xiaomi-quota.patch");
 await run("patch-check", ["git", "apply", "--check", patch]);
 await run("patch", ["git", "apply", patch]);
 const patched = await run("patched-tests", [process.execPath, "test"], true);
@@ -81,10 +84,12 @@ if (
   passes(patched.log) <= passes(baseline.log)
 )
   throw new Error("New/missing test results; inspect logs.");
-await run("xiaomi-tests", [
+await run(loginBridge ? "login-bridge-tests" : "xiaomi-tests", [
   process.execPath,
   "test",
-  "tests/xiaomiQuota.test.ts",
+  ...(loginBridge
+    ? ["tests/pluginSnapshotBridge.test.ts", "tests/pluginSnapshotApi.test.ts"]
+    : ["tests/xiaomiQuota.test.ts"]),
 ]);
 await run("patched-lint", [process.execPath, "run", "lint"]);
 await run("patched-types", [process.execPath, "run", "type-check"]);
@@ -132,6 +137,7 @@ for (const name of [
   );
 const manifest = {
   schemaVersion: 1,
+  variant: loginBridge ? "native-plugin-login-bridge" : "legacy-xiaomi-card",
   project: "godlyfast/cpa-xiaomi-tokenplan-quota",
   sourceCommit: source.stdout.toString().trim(),
   sourceTreeClean: status.stdout.toString().trim() === "",
