@@ -1,14 +1,18 @@
 # Xiaomi Token Plan quota for CLIProxyAPI
 
-A small, unofficial **Singapore Xiaomi MiMo Token Plan Credits** collector plus a pinned CLIProxyAPI management-dashboard patch. No inference requests, gateway plugin, gateway fork, arbitrary upstream proxy, or browser automation service.
+An unofficial **Singapore Xiaomi MiMo Token Plan Credits** collector and a **native CLIProxyAPI plugin**. No inference requests, gateway fork, arbitrary upstream proxy, or browser automation service.
 
-**Status: offline-tested implementation; NOT installed or live-account validated.** Account binding, an independently approved session-secret provisioning/replay procedure, container-network isolation and rollback remain deployment gates. Publishing this repository is not installation approval. The console API is undocumented and can change.
+**v0.2.0: native plugin, stock dashboard.** It registers under Plugins and supplies its own authenticated quota page plus native quota-provider API. See [native build, tests, installation and rollback](native/README.md). The former v0.1.0 dashboard source patch remains in this repository for legacy users; it is **not required** by the native plugin.
+
+The collector was operator-approved and live-validated on the intended Singapore account; the native implementation has separate unit/race and real-gateway synthetic tests. Installation still requires explicit account binding, protected session provisioning, an isolated gateway/collector network and deployment approval. The console API is undocumented and can change.
 
 ## Why a collector?
 
 No ready-to-install Xiaomi quota plugin compatible with the pinned official dashboard was verified. Public implementations found during research used console-session authentication, not a supported inference-key quota API. Read-only discovery of the Singapore console confirmed `GET /api/v1/tokenPlan/usage` and `/detail`; removing browser credentials returned 401. This does **not** establish the minimum cookie recipe, cookie lifetime, replay viability, or which CPA key belongs to the console account.
 
-The vendor session stays in an owner-only file in the collector. The dashboard sends only:
+The vendor session stays in an owner-only file in the collector. The native plugin reads its configurable private collector URL without forwarding any credentials; the stock dashboard loads only the plugin resource shell. Because resource pages do not inherit the panel's login, the plugin page asks for the CPA management key and retains it only in page memory. Quota data is served through a host-authenticated plugin management route, never the public resource route. See [native architecture](native/README.md#architecture-and-authentication).
+
+For **legacy v0.1.0 only**, the patched dashboard sends:
 
 ```json
 {"method":"GET","url":"http://xiaomi-quota:8787/v1/quota","proxy_url":"direct"}
@@ -16,7 +20,7 @@ The vendor session stays in an owner-only file in the collector. The dashboard s
 
 through the gateway's authenticated `/v8/management/requests/api-call`. No Cookie, inference key, `authIndex`, `$TOKEN$`, or collector management key is sent by the panel. The collector itself has **no endpoint authentication**: its security boundary is a dedicated container network with **only the gateway and collector**, plus the gateway's outer management authentication. Anyone on that network could read quota; do not attach unrelated containers, publish a port, or expose the collector to LAN/WAN. Docker `expose` is not access control.
 
-## Dashboard
+## Legacy v0.1.0 patched dashboard
 
 The existing quota page always mounts a separate Xiaomi section; it checks enabled OpenAI-compatible configuration for the exact Singapore Token Plan base URL, not OAuth auth files or provider aliases. That check identifies a configured route, **not account ownership**. Operator confirmation and the collector's explicit account label provide the required account binding. Refresh retrieves the cached collector snapshot, not an inference request. Existing OAuth tab counts are unchanged; this is a separate config-backed section above them.
 
@@ -30,7 +34,9 @@ The card shows:
 
 Credits are not raw tokens, requests, dollars, PAYG balance, or CPA-observed usage. Decimal arithmetic uses strings/BigInt, not floating-point balances. JSON numbers must be nonnegative safe integers; fractional/large counters require exact decimal strings. Maximum counter length is 128 characters with up to 18 decimal places. Unknown pool identity/duplicates/invalid counters fail closed; unknown extra pools are ignored. Percentages round to two decimals. Over-limit usage retains used/limit and clamps remaining to zero.
 
-## Build and test
+## Collector and legacy panel build/test
+
+For the current native plugin, follow [native build/test](native/README.md#buildtest); no patched panel build is necessary.
 
 Requires Git and **Bun 1.3.14**. Node-compatible tooling can run TypeScript's CLI via the pinned toolchain. No production dependencies.
 
@@ -64,7 +70,7 @@ Required non-secret configuration:
 
 The secret must be a regular owner-only file (0600/0400), owned by the process UID; symlinks, group/world access, empty content, control characters and oversized contents are rejected. The container runs as UID/GID 1000. Do not put the cookie in environment variables, commands, Git, frontend storage, CPA inference config, debug output, or this repository. **No extraction/provisioning helper is provided.** Restart after operator-approved session replacement; authentication failure stops automatic upstream retries.
 
-The collector immediately polls once and then every 300 seconds, with no overlapping polls, a 10-second combined fetch deadline, a 1 MiB response limit and redirect refusal. Only the two fixed HTTPS vendor GET paths are allowed. It preserves the observed discovery timezone header `Europe/Kiev`; validity timestamps are normalized as UTC solely because discovery explicitly matched that field to a UTC console label. Independent replay/timezone behaviour is still unverified. Unsupported dates/schema fail closed. No reset timestamp is fabricated.
+The collector immediately polls once and then every 300 seconds, with no overlapping polls, a 10-second combined fetch deadline, a 1 MiB response limit and redirect refusal. Only the two fixed HTTPS vendor GET paths are allowed. It preserves the observed discovery timezone header `Europe/Kiev`; validity timestamps are normalized as UTC solely because discovery explicitly matched that field to a UTC console label. The intended account's replay and UTC validity were operator-approved and compared with its console during initial deployment; cross-account/region behaviour and long-term session survival are not established. Unsupported dates/schema fail closed. No reset timestamp is fabricated.
 
 `GET /v1/quota` returns a strict sanitized schema; reads do not poll the vendor. Old successes survive failures with explicit error/stale flags. Data older than 600 seconds is stale. The panel recalculates age as time passes, and hides prior snapshots on session changes. `GET /healthz` reports process liveness only, **not** a valid vendor session or current quota. All other routes/query strings/methods are denied. No CORS access is added. The provider itself may lag up to five minutes; collector timestamp is not proof counters are instantaneous.
 
@@ -72,6 +78,6 @@ The collector immediately polls once and then every 300 seconds, with no overlap
 
 - Official panel **v1.26.7**: `714de0760a3ce86094b178fb46f834d34bc4a2a5`.
 - Unmodified backend **v8.0.44**: `1f917e77c4562623aa49e9804d999524151a2f96`.
-- The integration is a source patch and sidecar, not a dynamically installable CPA plugin. Future panel/gateway versions require compatibility review.
+- v0.2.0 is a native C ABI plugin plus sidecar; the stock panel is unchanged. The previous source patch is legacy only. Future panel/gateway versions require compatibility review.
 - Synthetic fixtures only. No live vendor session, inference key, management key, user ID or captured account balance is shipped.
 - MIT; preserve [third-party notices](THIRD_PARTY_NOTICES.md). No Xiaomi endorsement or warranty.

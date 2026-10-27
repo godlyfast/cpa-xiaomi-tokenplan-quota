@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="no-referrer"><title>Xiaomi Token Plan</title>
+<style>:root{color-scheme:light dark;font:16px system-ui}body{max-width:880px;margin:32px auto;padding:0 20px}h1{font-size:1.6rem}label{display:block;margin:16px 0 6px}input,button{font:inherit;padding:10px;border:1px solid #888;border-radius:5px}input{width:min(90%,440px)}button{cursor:pointer}#status{padding:12px;border:1px solid #888;border-radius:5px}section{margin:20px 0;padding:16px;border:1px solid #888;border-radius:6px}dl{display:grid;grid-template-columns:1fr 1fr;gap:10px}dd{margin:0;text-align:right}progress{width:100%}.muted{opacity:.8;font-size:.9rem}.warning{color:#b55e00}</style></head>
+<body><h1>Xiaomi Token Plan</h1><p>Singapore · vendor Credits, not tokens or a rolling-window quota</p>
+<form id="login"><label for="key">CPA management key</label><input id="key" type="password" autocomplete="off" required aria-describedby="security"><button type="submit">Connect</button><p id="security" class="muted">The stock dashboard does not pass its login to plugin pages. This key stays only in page memory; never sent to Xiaomi or the collector. This plugin is trusted code served on the CPA origin.</p></form>
+<p><button id="refresh" type="button" hidden>Refresh</button> <button id="disconnect" type="button" hidden>Disconnect</button></p>
+<p id="status" role="status" aria-live="polite">Management authentication required. No quota is public.</p><div id="quota"></div><p class="muted">Auto-refresh every 60 seconds while visible. Collector polls Xiaomi every five minutes. Monthly Credits overlap plan Credits — never sum pools. Subscription expiry is not a quota reset. Reauthentication of the Xiaomi session is a separate operator action.</p>
+<script>
+'use strict';
+let key='',busy=false,generation=0,controller=null;
+const byId=id=>document.getElementById(id),status=byId('status'),quota=byId('quota');
+function clear(message){quota.replaceChildren();status.textContent=message}
+function disconnect(message='Disconnected. Management authentication required.') {generation++;controller?.abort();controller=null;busy=false;key='';byId('key').value='';byId('login').hidden=false;byId('refresh').hidden=true;byId('disconnect').hidden=true;clear(message)}
+function item(list,label,value){const dt=document.createElement('dt'),dd=document.createElement('dd');dt.textContent=label;dd.textContent=value;list.append(dt,dd)}
+function show(s){
+ quota.replaceChildren();
+ const error=s.error==='auth_required'?'Xiaomi session expired — operator reauthentication required':s.error==='schema_changed'?'Vendor response changed — operator review required':s.error?'Collector error':'';
+ status.textContent=[s.accountLabel,s.planName,s.expired?'Subscription expired':s.stale?'STALE — last known values':'Fresh',error].filter(Boolean).join(' · ');
+ status.className=s.stale||s.error||s.expired?'warning':'';
+ for(const pool of s.pools||[]){const card=document.createElement('section'),title=document.createElement('h2'),list=document.createElement('dl');title.textContent=pool.label;item(list,'Remaining Credits',pool.remaining);item(list,'Used Credits',pool.used);item(list,'Plan Credits',pool.limit);if(pool.remainingPercent!==null){item(list,'Remaining',pool.remainingPercent+'%');const meter=document.createElement('progress');meter.max=100;meter.value=Number(pool.remainingPercent);meter.setAttribute('aria-label',pool.label+' remaining');card.append(meter)}card.append(title,list);quota.append(card)}
+ const times=document.createElement('p');times.className='muted';times.textContent='Last fetched: '+(s.fetchedAt||'Never')+' · Subscription expires: '+(s.expiresAt||'Unknown')+' · Reset: not supplied by vendor';quota.append(times)
+}
+async function refresh(){
+ if(!key||busy||document.hidden)return;busy=true;const session=generation;const current=new AbortController();controller=current;
+ try{const r=await fetch('/v0/management/plugins/xiaomi-tokenplan-quota/snapshot',{method:'GET',headers:{Authorization:'Bearer '+key},credentials:'omit',cache:'no-store',redirect:'error',referrerPolicy:'no-referrer',signal:AbortSignal.any([current.signal,AbortSignal.timeout(5000)])});
+ if(session!==generation)return;
+ if(r.status===401||r.status===403){disconnect('Management authentication rejected. Re-enter the CPA management key.');return}
+ if(!r.ok)throw Error('unavailable');const s=await r.json();if(session!==generation)return;if(s.schemaVersion!==1||s.region!=='sgp'||!Array.isArray(s.pools))throw Error('schema');show(s)
+ }catch{if(session===generation)clear('Quota unavailable. Refresh to retry; no current balance is being asserted.')}finally{if(session===generation){busy=false;controller=null}}
+}
+byId('login').addEventListener('submit',e=>{e.preventDefault();key=byId('key').value.trim();byId('key').value='';if(!key)return;byId('login').hidden=true;byId('refresh').hidden=false;byId('disconnect').hidden=false;refresh()});
+byId('refresh').addEventListener('click',refresh);byId('disconnect').addEventListener('click',()=>disconnect());
+setInterval(refresh,60000);document.addEventListener('visibilitychange',()=>{if(!document.hidden)refresh()});window.addEventListener('pagehide',()=>disconnect())
+</script></body></html>
