@@ -1,0 +1,46 @@
+{
+  "usage": {
+    "code": 0,
+    "message": "",
+    "data": {
+      "monthUsage": {
+        "percent": 0.5454,
+        "items": [
+          {
+            "name": "month_total_token",
+            "used": 6000000000,
+            "limit": 11000000000,
+            "percent": 0.5454
+          }
+        ]
+      },
+      "usage": {
+        "percent": 0.54,
+        "items": [
+          {
+            "name": "plan_total_token",
+            "used": 6000000000,
+            "limit": 11000000000,
+            "percent": 0.54
+          },
+          {
+            "name": "compensation_total_token",
+            "used": 0,
+            "limit": 0,
+            "percent": 0
+          }
+        ]
+      }
+    }
+  },
+  "detail": {
+    "code": 0,
+    "message": "",
+    "data": {
+      "planCode": "standard",
+      "planName": "Standard",
+      "currentPeriodEnd": "2030-01-31 23:59:59",
+      "expired": false
+    }
+  }
+}
