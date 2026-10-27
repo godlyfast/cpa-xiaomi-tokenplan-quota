@@ -1,0 +1,38 @@
+# PROPOSAL ONLY — do not apply to a running gateway.
+# Merge through the operator's existing Portainer-managed stack.
+# The same dedicated bridge must contain exactly CPA and xiaomi-quota.
+services:
+  xiaomi-quota:
+    image: cpa-xiaomi-tokenplan-quota:0.1.0
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    user: "1000:1000"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    environment:
+      ACCOUNT_LABEL: ${ACCOUNT_LABEL:?Set an operator-approved non-secret account label}
+      ACCOUNT_REGION: sgp
+      ACCOUNT_BINDING_CONFIRMED: ${ACCOUNT_BINDING_CONFIRMED:?Confirm account binding first}
+      MIMO_COOKIE_FILE: /run/secrets/mimo_session
+    volumes:
+      - type: bind
+        source: ${MIMO_COOKIE_FILE:?Set a protected absolute session-file path}
+        target: /run/secrets/mimo_session
+        read_only: true
+    expose: ["8787"] # Not a host publication; never add ports.
+    networks: [xiaomi-quota]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "bun", "-e", "fetch('http://127.0.0.1:8787/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+networks:
+  xiaomi-quota:
+    external: true # Separately approved dedicated bridge, CPA + collector ONLY.
+    name: cpa-xiaomi-quota

@@ -1,8 +1,8 @@
-export type QuotaErrorCode = 'auth_required' | 'unavailable' | 'schema_changed';
+export type QuotaErrorCode = "auth_required" | "unavailable" | "schema_changed";
 export interface QuotaPool {
-  id: 'plan' | 'monthly' | 'compensation';
+  id: "plan" | "monthly" | "compensation";
   label: string;
-  unit: 'credits';
+  unit: "credits";
   used: string;
   limit: string;
   remaining: string;
@@ -10,7 +10,7 @@ export interface QuotaPool {
 }
 export interface QuotaSnapshot {
   schemaVersion: 1;
-  region: 'sgp';
+  region: "sgp";
   accountLabel: string;
   planName: string | null;
   pools: QuotaPool[];

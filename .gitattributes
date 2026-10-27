@@ -1,0 +1,3 @@
+# Unified-diff context lines consist of a significant leading space.
+# Upstream lint still checks the source after the patch is applied.
+panel/patches/*.patch whitespace=-blank-at-eol

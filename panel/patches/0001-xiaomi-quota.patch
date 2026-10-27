@@ -1,0 +1,861 @@
+diff --git a/src/features/quota/QuotaPage.tsx b/src/features/quota/QuotaPage.tsx
+index d7168ac..3bd81f2 100644
+--- a/src/features/quota/QuotaPage.tsx
++++ b/src/features/quota/QuotaPage.tsx
+@@ -51,6 +51,7 @@ import { useDevinQuotaAutoLoad } from './providers/devin/useDevinQuotaAutoLoad';
+ import { useQuotaActions } from './hooks/useQuotaActions';
+ import { useQuotaBatchLoader } from './hooks/useQuotaBatchLoader';
+ import { readQuotaUiState, writeQuotaUiState } from './uiState';
++import { XiaomiQuotaSection } from './xiaomi/XiaomiQuotaSection';
+ import styles from './QuotaPage.module.scss';
+ 
+ const TAB_IDS: string[] = ['all', ...QUOTA_TAB_ORDER];
+@@ -334,6 +335,8 @@ export function QuotaPage() {
+         onRefreshAll={handleRefreshAll}
+       />
+ 
++      <XiaomiQuotaSection disabled={disableControls} />
++
+       <section className={styles.workbench}>
+         {/* 提供商导航与搜索工具栏分层，避免不同控件争夺视觉焦点。 */}
+         <div className={styles.tabsRow} data-reveal>
+diff --git a/src/features/quota/xiaomi/XiaomiQuotaCard.module.scss b/src/features/quota/xiaomi/XiaomiQuotaCard.module.scss
+new file mode 100644
+index 0000000..da5c11d
+--- /dev/null
++++ b/src/features/quota/xiaomi/XiaomiQuotaCard.module.scss
+@@ -0,0 +1,41 @@
++.content {
++  display: grid;
++  gap: 12px;
++  overflow-wrap: anywhere;
++
++  p,
++  dl {
++    margin: 0;
++  }
++  dl {
++    display: grid;
++    gap: 6px;
++  }
++  dl > div {
++    display: flex;
++    justify-content: space-between;
++    flex-wrap: wrap;
++    gap: 4px 16px;
++  }
++  dd {
++    margin: 0;
++    font-variant-numeric: tabular-nums;
++  }
++  dt {
++    opacity: 0.75;
++  }
++  progress {
++    width: 100%;
++    accent-color: var(--primary-color);
++  }
++}
++.pools {
++  display: grid;
++  grid-template-columns: repeat(auto-fit, minmax(min(100%, 260px), 1fr));
++  gap: 16px;
++}
++.pool {
++  display: grid;
++  gap: 8px;
++  align-content: start;
++}
+diff --git a/src/features/quota/xiaomi/XiaomiQuotaCard.tsx b/src/features/quota/xiaomi/XiaomiQuotaCard.tsx
+new file mode 100644
+index 0000000..8b7f0dd
+--- /dev/null
++++ b/src/features/quota/xiaomi/XiaomiQuotaCard.tsx
+@@ -0,0 +1,119 @@
++import { useTranslation } from 'react-i18next';
++import { Card } from '@/components/ui/Card';
++import { Button } from '@/components/ui/Button';
++import type { XiaomiState } from './model';
++import { displayCredits } from './model';
++import styles from './XiaomiQuotaCard.module.scss';
++
++interface Props {
++  state: XiaomiState;
++  loading: boolean;
++  disabled: boolean;
++  onRefresh: () => void;
++  now: number;
++}
++export function XiaomiQuotaCard({ state, loading, disabled, onRefresh, now }: Props) {
++  const { t } = useTranslation();
++  const s = state.kind === 'ready' ? state.snapshot : null;
++  const stale =
++    s &&
++    (s.stale ||
++      !s.fetchedAt ||
++      now - Date.parse(s.fetchedAt) > 600000 ||
++      now < Date.parse(s.fetchedAt));
++  return (
++    <Card
++      title={t('xiaomi_quota.title')}
++      extra={
++        <Button
++          variant="secondary"
++          size="sm"
++          loading={loading}
++          disabled={disabled}
++          onClick={onRefresh}
++        >
++          {t('xiaomi_quota.refresh')}
++        </Button>
++      }
++    >
++      <div className={styles.content} aria-live="polite">
++        <p>
++          {t('xiaomi_quota.source')} · {t('xiaomi_quota.region')}
++        </p>
++        {state.kind !== 'ready' && <p role="status">{t('xiaomi_quota.' + state.kind)}</p>}
++        {s && (
++          <>
++            <p>
++              <strong>{s.accountLabel}</strong>
++              {s.planName ? ' · ' + s.planName : ''}
++            </p>
++            <p role="status">
++              {s.error && <span>{t('xiaomi_quota.' + s.error)} · </span>}
++              {stale && <span>{t('xiaomi_quota.stale')} · </span>}
++              {(s.expired || (s.expiresAt && now >= Date.parse(s.expiresAt))) && (
++                <span>{t('xiaomi_quota.expired')}</span>
++              )}
++            </p>
++            <div className={styles.pools}>
++              {s.pools.map((pool) => (
++                <section className={styles.pool} key={pool.id}>
++                  <strong>{t('xiaomi_quota.' + pool.id)}</strong>
++                  <dl>
++                    <div>
++                      <dt>{t('xiaomi_quota.remaining')}</dt>
++                      <dd>
++                        {displayCredits(pool.remaining)} Credits
++                        {pool.remainingPercent !== null && ' (' + pool.remainingPercent + '%)'}
++                      </dd>
++                    </div>
++                    <div>
++                      <dt>{t('xiaomi_quota.used')}</dt>
++                      <dd>
++                        {displayCredits(pool.used)} / {displayCredits(pool.limit)} Credits
++                      </dd>
++                    </div>
++                  </dl>
++                  {pool.remainingPercent !== null && (
++                    <progress
++                      max={100}
++                      value={Number(pool.remainingPercent)}
++                      aria-label={t('xiaomi_quota.remaining')}
++                    />
++                  )}
++                </section>
++              ))}
++            </div>
++            <dl>
++              <div>
++                <dt>{t('xiaomi_quota.checked')}</dt>
++                <dd>
++                  {s.fetchedAt ? (
++                    <time dateTime={s.fetchedAt}>{s.fetchedAt}</time>
++                  ) : (
++                    t('xiaomi_quota.unknown')
++                  )}
++                </dd>
++              </div>
++              {s.expiresAt && (
++                <div>
++                  <dt>{t('xiaomi_quota.valid_until')}</dt>
++                  <dd>
++                    <time dateTime={s.expiresAt}>{s.expiresAt}</time>
++                  </dd>
++                </div>
++              )}
++            </dl>
++          </>
++        )}
++        <p>{t('xiaomi_quota.delay')}</p>
++        <a
++          href="https://platform.xiaomimimo.com/#/console/plan-manage"
++          target="_blank"
++          rel="noopener noreferrer"
++        >
++          {t('xiaomi_quota.console')}
++        </a>
++      </div>
++    </Card>
++  );
++}
+diff --git a/src/features/quota/xiaomi/XiaomiQuotaSection.tsx b/src/features/quota/xiaomi/XiaomiQuotaSection.tsx
+new file mode 100644
+index 0000000..f1c805d
+--- /dev/null
++++ b/src/features/quota/xiaomi/XiaomiQuotaSection.tsx
+@@ -0,0 +1,60 @@
++import { useCallback, useEffect, useRef, useState } from 'react';
++import { providersApi } from '@/services/api/providers';
++import { useQuotaStore } from '@/stores';
++import { useNow } from '@/hooks/useNow';
++import { XiaomiQuotaCard } from './XiaomiQuotaCard';
++import { fetchXiaomiQuota, hasSingaporePlan, type XiaomiState } from './model';
++
++/** Independent config source: never depends on auth-file enumeration or provider aliases. */
++export function XiaomiQuotaSection({ disabled }: { disabled: boolean }) {
++  const generation = useQuotaStore((s) => s.cacheGeneration);
++  const [state, setState] = useState<XiaomiState>({ kind: 'loading' });
++  const [loading, setLoading] = useState(false);
++  const active = useRef<AbortController | null>(null);
++  const now = useNow(!disabled && state.kind === 'ready');
++  const load = useCallback(async () => {
++    active.current?.abort();
++    const controller = new AbortController();
++    active.current = controller;
++    const current = () =>
++      !controller.signal.aborted && useQuotaStore.getState().cacheGeneration === generation;
++    if (disabled) {
++      setState({ kind: 'unavailable' });
++      setLoading(false);
++      return;
++    }
++    setLoading(true);
++    setState({ kind: 'loading' });
++    try {
++      const providers = await providersApi.getOpenAIProviders();
++      if (!current()) return;
++      if (!hasSingaporePlan(providers)) {
++        setState({ kind: 'unconfigured' });
++        return;
++      }
++      const snapshot = await fetchXiaomiQuota(controller.signal);
++      if (current()) setState({ kind: 'ready', snapshot });
++    } catch {
++      if (current()) setState({ kind: 'unavailable' });
++    } finally {
++      if (current()) setLoading(false);
++    }
++  }, [disabled, generation]);
++  useEffect(() => {
++    void load();
++    return () => {
++      active.current?.abort();
++    };
++  }, [load]);
++  return (
++    <XiaomiQuotaCard
++      state={disabled ? { kind: 'unavailable' } : state}
++      loading={loading}
++      disabled={disabled}
++      onRefresh={() => {
++        void load();
++      }}
++      now={now}
++    />
++  );
++}
+diff --git a/src/features/quota/xiaomi/credit.ts b/src/features/quota/xiaomi/credit.ts
+new file mode 100644
+index 0000000..012b8bd
+--- /dev/null
++++ b/src/features/quota/xiaomi/credit.ts
+@@ -0,0 +1,41 @@
++/** Exact decimal Credits. Numeric JSON must be safe integers; fractions need strings. */
++export function credit(input: unknown): string {
++  if (typeof input === 'number') {
++    if (!Number.isSafeInteger(input) || input < 0) throw new Error('Invalid Credits');
++    input = String(input);
++  }
++  if (typeof input !== 'string' || input.length > 128 || !/^\d+(?:\.\d{1,18})?$/.test(input)) {
++    throw new Error('Invalid Credits');
++  }
++  const [whole, fraction = ''] = input.split('.');
++  const normalized = whole.replace(/^0+(?=\d)/, '');
++  const tail = fraction.replace(/0+$/, '');
++  return normalized + (tail ? '.' + tail : '');
++}
++function scaled(value: string, digits: number): bigint {
++  const [whole, fraction = ''] = value.split('.');
++  return BigInt(whole + fraction.padEnd(digits, '0'));
++}
++function decimal(value: bigint, digits: number): string {
++  if (!digits) return value.toString();
++  const raw = value.toString().padStart(digits + 1, '0');
++  return credit(raw.slice(0, -digits) + '.' + raw.slice(-digits));
++}
++export function balance(usedValue: unknown, limitValue: unknown) {
++  const used = credit(usedValue),
++    limit = credit(limitValue);
++  const digits = Math.max(used.split('.')[1]?.length ?? 0, limit.split('.')[1]?.length ?? 0);
++  const u = scaled(used, digits),
++    l = scaled(limit, digits);
++  const remaining = l > u ? l - u : 0n;
++  const hundredths = l ? (remaining * 10000n + l / 2n) / l : null;
++  return {
++    used,
++    limit,
++    remaining: decimal(remaining, digits),
++    remainingPercent:
++      hundredths === null
++        ? null
++        : (hundredths / 100n).toString() + '.' + (hundredths % 100n).toString().padStart(2, '0'),
++  };
++}
+diff --git a/src/features/quota/xiaomi/model.ts b/src/features/quota/xiaomi/model.ts
+new file mode 100644
+index 0000000..60f2aed
+--- /dev/null
++++ b/src/features/quota/xiaomi/model.ts
+@@ -0,0 +1,131 @@
++import { apiCallApi } from '@/services/api/apiCall';
++import { balance } from './credit';
++import type { QuotaSnapshot, QuotaPool, QuotaErrorCode } from './types';
++
++export type XiaomiState =
++  { kind: 'loading' | 'unconfigured' | 'unavailable' } | { kind: 'ready'; snapshot: QuotaSnapshot };
++const record = (v: unknown): v is Record<string, unknown> =>
++  typeof v === 'object' && v !== null && !Array.isArray(v);
++const invalid = (): never => {
++  throw new Error('Invalid Xiaomi quota snapshot');
++};
++const instant = (v: unknown): string | null => {
++  if (v === null) return null;
++  if (
++    typeof v !== 'string' ||
++    !/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/.test(v) ||
++    !Number.isFinite(Date.parse(v)) ||
++    new Date(v).toISOString() !== v
++  )
++    return invalid();
++  return v;
++};
++export function hasSingaporePlan(providers: unknown): boolean {
++  return (
++    Array.isArray(providers) &&
++    providers.some(
++      (p) =>
++        record(p) &&
++        p.disabled !== true &&
++        typeof p.baseUrl === 'string' &&
++        /^https:\/\/token-plan-sgp\.xiaomimimo\.com\/v1\/?$/.test(p.baseUrl)
++    )
++  );
++}
++export function parseSnapshot(value: unknown): QuotaSnapshot {
++  if (
++    !record(value) ||
++    value.schemaVersion !== 1 ||
++    value.region !== 'sgp' ||
++    typeof value.accountLabel !== 'string' ||
++    !value.accountLabel.trim() ||
++    value.accountLabel.length > 80 ||
++    Array.from(value.accountLabel).some((c) => c.charCodeAt(0) < 32 || c.charCodeAt(0) === 127) ||
++    typeof value.stale !== 'boolean' ||
++    (value.expired !== null && typeof value.expired !== 'boolean') ||
++    value.resetsAt !== null
++  )
++    return invalid();
++  const errors: (QuotaErrorCode | null)[] = [
++    null,
++    'auth_required',
++    'unavailable',
++    'schema_changed',
++  ];
++  if (
++    !errors.includes(value.error as QuotaErrorCode | null) ||
++    !Array.isArray(value.pools) ||
++    value.pools.length > 3
++  )
++    return invalid();
++  const names: Record<string, string> = {
++    plan: 'Plan Credits',
++    monthly: 'Monthly Credits (overlapping)',
++    compensation: 'Compensation Credits',
++  };
++  const ids = new Set<string>();
++  const pools = value.pools.map((p: unknown): QuotaPool => {
++    if (
++      !record(p) ||
++      typeof p.id !== 'string' ||
++      !Object.prototype.hasOwnProperty.call(names, p.id) ||
++      ids.has(p.id) ||
++      p.unit !== 'credits' ||
++      typeof p.used !== 'string' ||
++      typeof p.limit !== 'string'
++    )
++      return invalid();
++    ids.add(p.id);
++    const counters = balance(p.used, p.limit);
++    if (
++      counters.used !== p.used ||
++      counters.limit !== p.limit ||
++      counters.remaining !== p.remaining ||
++      counters.remainingPercent !== p.remainingPercent
++    )
++      return invalid();
++    return { id: p.id as QuotaPool['id'], label: names[p.id], unit: 'credits', ...counters };
++  });
++  const fetchedAt = instant(value.fetchedAt),
++    expiresAt = instant(value.expiresAt);
++  if (
++    value.error === null &&
++    (!fetchedAt || !ids.has('plan') || !ids.has('monthly') || value.expired === null)
++  )
++    return invalid();
++  if (
++    value.planName !== null &&
++    !['Lite', 'Standard', 'Pro', 'Max', 'Ultra'].includes(value.planName as string)
++  )
++    return invalid();
++  return {
++    schemaVersion: 1,
++    region: 'sgp',
++    accountLabel: value.accountLabel,
++    planName: value.planName as string | null,
++    pools,
++    fetchedAt,
++    expiresAt,
++    expired: value.expired as boolean | null,
++    resetsAt: null,
++    stale: value.stale || value.error !== null,
++    error: value.error as QuotaErrorCode | null,
++  };
++}
++export async function fetchXiaomiQuota(signal?: AbortSignal): Promise<QuotaSnapshot> {
++  const result = await apiCallApi.request(
++    {
++      method: 'GET',
++      url: 'http://xiaomi-quota:8787/v1/quota',
++      proxy_url: 'direct',
++    },
++    { timeout: 15000, signal }
++  );
++  if (result.statusCode !== 200) throw new Error('Xiaomi quota unavailable');
++  return parseSnapshot(result.body);
++}
++/** Group decimal strings without lossy Number conversion. */
++export function displayCredits(value: string): string {
++  const [whole, tail] = value.split('.');
++  return whole.replace(/\B(?=(\d{3})+(?!\d))/g, ',') + (tail ? '.' + tail : '');
++}
+diff --git a/src/features/quota/xiaomi/types.ts b/src/features/quota/xiaomi/types.ts
+new file mode 100644
+index 0000000..7476a00
+--- /dev/null
++++ b/src/features/quota/xiaomi/types.ts
+@@ -0,0 +1,23 @@
++export type QuotaErrorCode = 'auth_required' | 'unavailable' | 'schema_changed';
++export interface QuotaPool {
++  id: 'plan' | 'monthly' | 'compensation';
++  label: string;
++  unit: 'credits';
++  used: string;
++  limit: string;
++  remaining: string;
++  remainingPercent: string | null;
++}
++export interface QuotaSnapshot {
++  schemaVersion: 1;
++  region: 'sgp';
++  accountLabel: string;
++  planName: string | null;
++  pools: QuotaPool[];
++  fetchedAt: string | null;
++  expiresAt: string | null;
++  expired: boolean | null;
++  resetsAt: null;
++  stale: boolean;
++  error: QuotaErrorCode | null;
++}
+diff --git a/src/i18n/locales/en.json b/src/i18n/locales/en.json
+index 3414104..ec336f7 100644
+--- a/src/i18n/locales/en.json
++++ b/src/i18n/locales/en.json
+@@ -1,4 +1,27 @@
+ {
++  "xiaomi_quota": {
++    "title": "Xiaomi MiMo Token Plan",
++    "refresh": "Refresh cached snapshot",
++    "source": "Unofficial console-session source",
++    "region": "Singapore",
++    "loading": "Loading",
++    "unconfigured": "Not configured: an enabled Singapore Token Plan provider is required.",
++    "unavailable": "Unavailable: check the private collector and management connection.",
++    "auth_required": "Session required: replace the protected collector session and restart.",
++    "schema_changed": "Provider schema changed",
++    "stale": "Stale — last known balance, not current quota",
++    "expired": "Expired",
++    "plan": "Plan Credits",
++    "monthly": "Monthly Credits (overlapping — do not add)",
++    "compensation": "Compensation Credits (separate)",
++    "remaining": "Remaining",
++    "used": "Used / limit",
++    "checked": "Last fetched (UTC)",
++    "unknown": "Unknown",
++    "valid_until": "Valid until (UTC)",
++    "delay": "Provider data may lag by up to 5 minutes; collector refreshes every 5 minutes. Expiry is not a reset time.",
++    "console": "Open official console"
++  },
+   "common": {
+     "login": "Login",
+     "logout": "Logout",
+diff --git a/src/i18n/locales/ko.json b/src/i18n/locales/ko.json
+index 91f95eb..7577546 100644
+--- a/src/i18n/locales/ko.json
++++ b/src/i18n/locales/ko.json
+@@ -1,4 +1,27 @@
+ {
++  "xiaomi_quota": {
++    "title": "Xiaomi MiMo Token Plan",
++    "refresh": "캐시 스냅샷 새로 고침",
++    "source": "비공식 콘솔 세션 출처",
++    "region": "싱가포르",
++    "loading": "불러오는 중",
++    "unconfigured": "미설정: 활성화된 싱가포르 Token Plan 공급자가 필요합니다.",
++    "unavailable": "사용 불가: 비공개 수집기와 관리 연결을 확인하세요.",
++    "auth_required": "세션 필요: 보호된 수집기 세션을 교체하고 다시 시작하세요.",
++    "schema_changed": "공급자 데이터 구조가 변경되었습니다",
++    "stale": "오래된 데이터 — 마지막 잔액이며 현재 할당량이 아닙니다",
++    "expired": "만료됨",
++    "plan": "플랜 Credits",
++    "monthly": "월간 Credits (중복 — 합산 금지)",
++    "compensation": "보상 Credits (별도)",
++    "remaining": "남은 양",
++    "used": "사용량 / 한도",
++    "checked": "마지막 조회 (UTC)",
++    "unknown": "알 수 없음",
++    "valid_until": "유효 기간 (UTC)",
++    "delay": "공급자 데이터는 최대 5분 지연될 수 있으며 수집기는 5분마다 갱신합니다. 만료 시각은 초기화 시각이 아닙니다.",
++    "console": "공식 콘솔 열기"
++  },
+   "common": {
+     "login": "로그인",
+     "logout": "로그아웃",
+diff --git a/src/i18n/locales/ru.json b/src/i18n/locales/ru.json
+index 33a2375..bdc5f72 100644
+--- a/src/i18n/locales/ru.json
++++ b/src/i18n/locales/ru.json
+@@ -1,4 +1,27 @@
+ {
++  "xiaomi_quota": {
++    "title": "Xiaomi MiMo Token Plan",
++    "refresh": "Обновить снимок кэша",
++    "source": "Неофициальный источник: сессия консоли",
++    "region": "Сингапур",
++    "loading": "Загрузка",
++    "unconfigured": "Не настроено: нужен активный провайдер Singapore Token Plan.",
++    "unavailable": "Недоступно: проверьте закрытый сборщик и соединение управления.",
++    "auth_required": "Нужна сессия: замените защищённую сессию сборщика и перезапустите его.",
++    "schema_changed": "Схема провайдера изменилась",
++    "stale": "Устаревшие данные — последний баланс, не текущая квота",
++    "expired": "Срок истёк",
++    "plan": "Credits плана",
++    "monthly": "Месячные Credits (пересекаются — не суммировать)",
++    "compensation": "Компенсационные Credits (отдельно)",
++    "remaining": "Осталось",
++    "used": "Использовано / лимит",
++    "checked": "Последний запрос (UTC)",
++    "unknown": "Неизвестно",
++    "valid_until": "Действует до (UTC)",
++    "delay": "Задержка данных провайдера — до 5 минут; сборщик обновляет их каждые 5 минут. Срок действия не означает сброс.",
++    "console": "Открыть официальную консоль"
++  },
+   "common": {
+     "login": "Войти",
+     "logout": "Выйти",
+diff --git a/src/i18n/locales/vi.json b/src/i18n/locales/vi.json
+index 6e0f5d4..e65a761 100644
+--- a/src/i18n/locales/vi.json
++++ b/src/i18n/locales/vi.json
+@@ -1,4 +1,27 @@
+ {
++  "xiaomi_quota": {
++    "title": "Xiaomi MiMo Token Plan",
++    "refresh": "Làm mới bản chụp bộ nhớ đệm",
++    "source": "Nguồn phiên bảng điều khiển không chính thức",
++    "region": "Singapore",
++    "loading": "Đang tải",
++    "unconfigured": "Chưa cấu hình: cần nhà cung cấp Singapore Token Plan đang bật.",
++    "unavailable": "Không khả dụng: kiểm tra bộ thu thập riêng và kết nối quản lý.",
++    "auth_required": "Cần phiên: thay phiên được bảo vệ của bộ thu thập rồi khởi động lại.",
++    "schema_changed": "Cấu trúc dữ liệu nhà cung cấp đã đổi",
++    "stale": "Dữ liệu cũ — số dư lần trước, không phải hạn mức hiện tại",
++    "expired": "Đã hết hạn",
++    "plan": "Credits gói",
++    "monthly": "Credits tháng (chồng lấp — không cộng)",
++    "compensation": "Credits bồi thường (riêng)",
++    "remaining": "Còn lại",
++    "used": "Đã dùng / giới hạn",
++    "checked": "Lần lấy cuối (UTC)",
++    "unknown": "Không rõ",
++    "valid_until": "Có hiệu lực đến (UTC)",
++    "delay": "Dữ liệu có thể chậm tối đa 5 phút; bộ thu thập làm mới mỗi 5 phút. Thời điểm hết hạn không phải thời điểm đặt lại.",
++    "console": "Mở bảng điều khiển chính thức"
++  },
+   "common": {
+     "login": "Đăng nhập",
+     "logout": "Đăng xuất",
+diff --git a/src/i18n/locales/zh-CN.json b/src/i18n/locales/zh-CN.json
+index 8ac7e3e..d3eb493 100644
+--- a/src/i18n/locales/zh-CN.json
++++ b/src/i18n/locales/zh-CN.json
+@@ -1,4 +1,27 @@
+ {
++  "xiaomi_quota": {
++    "title": "小米 MiMo Token Plan",
++    "refresh": "刷新缓存快照",
++    "source": "非官方控制台会话来源",
++    "region": "新加坡",
++    "loading": "加载中",
++    "unconfigured": "未配置：需要已启用的新加坡 Token Plan 提供商。",
++    "unavailable": "不可用：请检查私有采集器与管理连接。",
++    "auth_required": "需要会话：请更换受保护的采集器会话并重启。",
++    "schema_changed": "提供商数据结构已更改",
++    "stale": "数据已过期 — 上次余额，非当前配额",
++    "expired": "套餐已到期",
++    "plan": "套餐 Credits",
++    "monthly": "月度 Credits（重叠，勿相加）",
++    "compensation": "补偿 Credits（单独）",
++    "remaining": "剩余",
++    "used": "已用 / 上限",
++    "checked": "上次获取（UTC）",
++    "unknown": "未知",
++    "valid_until": "有效期至（UTC）",
++    "delay": "提供商数据最多延迟 5 分钟；采集器每 5 分钟刷新。到期时间不代表重置时间。",
++    "console": "打开官方控制台"
++  },
+   "common": {
+     "login": "登录",
+     "logout": "登出",
+diff --git a/src/i18n/locales/zh-TW.json b/src/i18n/locales/zh-TW.json
+index 8b873dc..4963387 100644
+--- a/src/i18n/locales/zh-TW.json
++++ b/src/i18n/locales/zh-TW.json
+@@ -1,4 +1,27 @@
+ {
++  "xiaomi_quota": {
++    "title": "小米 MiMo Token Plan",
++    "refresh": "重新整理快取快照",
++    "source": "非官方控制台工作階段來源",
++    "region": "新加坡",
++    "loading": "載入中",
++    "unconfigured": "未設定：需要已啟用的新加坡 Token Plan 提供者。",
++    "unavailable": "無法使用：請檢查私有收集器與管理連線。",
++    "auth_required": "需要工作階段：請更換受保護的收集器工作階段並重新啟動。",
++    "schema_changed": "提供者資料結構已變更",
++    "stale": "資料過時 — 上次餘額，非目前配額",
++    "expired": "方案已到期",
++    "plan": "方案 Credits",
++    "monthly": "每月 Credits（重疊，勿相加）",
++    "compensation": "補償 Credits（獨立）",
++    "remaining": "剩餘",
++    "used": "已用 / 上限",
++    "checked": "上次擷取（UTC）",
++    "unknown": "未知",
++    "valid_until": "有效期限（UTC）",
++    "delay": "提供者資料最多延遲 5 分鐘；收集器每 5 分鐘更新。到期時間不是重設時間。",
++    "console": "開啟官方控制台"
++  },
+   "common": {
+     "login": "登入",
+     "logout": "登出",
+diff --git a/tests/xiaomiQuota.test.ts b/tests/xiaomiQuota.test.ts
+new file mode 100644
+index 0000000..8f086e2
+--- /dev/null
++++ b/tests/xiaomiQuota.test.ts
+@@ -0,0 +1,191 @@
++import { expect, mock, spyOn, test } from 'bun:test';
++import i18n from '../src/i18n/index';
++import { I18nextProvider } from 'react-i18next';
++const english = i18n.cloneInstance({ lng: 'en' });
++import { createElement } from 'react';
++import { renderToStaticMarkup } from 'react-dom/server';
++import { apiCallApi } from '../src/services/api/apiCall';
++import {
++  hasSingaporePlan,
++  fetchXiaomiQuota,
++  parseSnapshot,
++} from '../src/features/quota/xiaomi/model';
++import { XiaomiQuotaCard } from '../src/features/quota/xiaomi/XiaomiQuotaCard';
++import type { QuotaSnapshot } from '../src/features/quota/xiaomi/types';
++import { QUOTA_CLASS_KEYS } from '../src/features/quota/types';
++const sample: QuotaSnapshot = {
++  schemaVersion: 1,
++  region: 'sgp',
++  accountLabel: 'Synthetic Singapore',
++  planName: 'Standard',
++  pools: [
++    {
++      id: 'plan',
++      label: 'Plan Credits',
++      unit: 'credits',
++      used: '6000000000',
++      limit: '11000000000',
++      remaining: '5000000000',
++      remainingPercent: '45.45',
++    },
++    {
++      id: 'monthly',
++      label: 'Monthly Credits (overlapping)',
++      unit: 'credits',
++      used: '6000000000',
++      limit: '11000000000',
++      remaining: '5000000000',
++      remainingPercent: '45.45',
++    },
++    {
++      id: 'compensation',
++      label: 'Compensation Credits',
++      unit: 'credits',
++      used: '0',
++      limit: '0',
++      remaining: '0',
++      remainingPercent: null,
++    },
++  ],
++  fetchedAt: '2030-01-01T00:00:00.000Z',
++  expiresAt: '2030-01-31T23:59:59.000Z',
++  expired: false,
++  resetsAt: null,
++  stale: false,
++  error: null,
++};
++const render = (
++  state: Parameters<typeof XiaomiQuotaCard>[0]['state'],
++  now = Date.parse('2030-01-01T00:00:00Z')
++) =>
++  renderToStaticMarkup(
++    createElement(
++      I18nextProvider,
++      { i18n: english },
++      createElement(XiaomiQuotaCard, {
++        state,
++        loading: false,
++        disabled: false,
++        onRefresh: () => {},
++        now,
++      })
++    )
++  );
++
++test('quota page mounts Xiaomi independently while OAuth file list is still empty', async () => {
++  // Bun does not implement Vite CSS Modules. Substitute only that build boundary,
++  // retaining the real page, providers, card and empty auth-file state.
++  mock.module('../src/features/quota/components/QuotaBody.module.scss', () => ({
++    default: Object.fromEntries(QUOTA_CLASS_KEYS.map((k) => [k, k])),
++  }));
++  mock.module('../src/features/quota/QuotaPage.module.scss', () => ({
++    default: { page: 'page', workbench: 'workbench', search: 'search' },
++  }));
++  const { QuotaPage } = await import('../src/features/quota/QuotaPage');
++  const html = renderToStaticMarkup(
++    createElement(I18nextProvider, { i18n: english }, createElement(QuotaPage))
++  );
++  expect(html).toContain('Xiaomi MiMo Token Plan');
++  expect(html).toContain('https://platform.xiaomimimo.com/#/console/plan-manage');
++});
++test('config-only Singapore provider needs no auth file or inference key to qualify', () => {
++  expect(
++    hasSingaporePlan([{ baseUrl: 'https://token-plan-sgp.xiaomimimo.com/v1', name: 'Any alias' }])
++  ).toBe(true);
++  expect(
++    hasSingaporePlan([{ baseUrl: 'https://token-plan-sgp.xiaomimimo.com/v1/', disabled: false }])
++  ).toBe(true);
++  for (const providers of [
++    [],
++    [{ baseUrl: 'https://api.xiaomimimo.com/v1', name: 'xiaomi' }],
++    [{ baseUrl: 'https://token-plan-sgp.xiaomimimo.com.evil.invalid/v1' }],
++    [{ baseUrl: 'https://token-plan-sgp.xiaomimimo.com/v1', disabled: true }],
++  ])
++    expect(hasSingaporePlan(providers)).toBe(false);
++});
++test('management request targets fixed private collector with no vendor credentials', async () => {
++  const proxy = spyOn(apiCallApi, 'request').mockResolvedValue({
++    statusCode: 200,
++    header: {},
++    bodyText: '',
++    body: sample,
++  });
++  try {
++    expect(await fetchXiaomiQuota()).toEqual(sample);
++    const request = proxy.mock.calls[0][0];
++    expect(request).toEqual({
++      method: 'GET',
++      url: 'http://xiaomi-quota:8787/v1/quota',
++      proxy_url: 'direct',
++    });
++    expect(JSON.stringify(request)).not.toMatch(/cookie|authIndex|TOKEN|api.key/i);
++  } finally {
++    proxy.mockRestore();
++  }
++});
++test('outer proxy failure, schema drift and invented balance fail closed', async () => {
++  const proxy = spyOn(apiCallApi, 'request').mockResolvedValue({
++    statusCode: 401,
++    header: {},
++    bodyText: 'private',
++    body: sample,
++  });
++  try {
++    await expect(fetchXiaomiQuota()).rejects.toThrow();
++  } finally {
++    proxy.mockRestore();
++  }
++  for (const bad of [
++    { ...sample, region: 'cn' },
++    { ...sample, schemaVersion: 2 },
++    { ...sample, pools: [] },
++    { ...sample, pools: [sample.pools[0], sample.pools[0]] },
++    { ...sample, pools: [{ ...sample.pools[0], remaining: '999' }, sample.pools[1]] },
++    { ...sample, fetchedAt: '2030-02-30T00:00:00.000Z' },
++  ])
++    expect(() => parseSnapshot(bad)).toThrow();
++});
++test('real card renders Credits, distinct overlapping pools, identity and validity, not reset', () => {
++  const html = render({ kind: 'ready', snapshot: sample });
++  for (const text of [
++    '5,000,000,000',
++    '6,000,000,000',
++    '11,000,000,000',
++    '45.45%',
++    'Credits',
++    'Synthetic Singapore',
++    'Singapore',
++    'Monthly',
++    'Compensation',
++    'Valid until',
++    'Unofficial',
++    '2030-01-31T23:59:59.000Z',
++  ])
++    expect(html).toContain(text);
++  expect(html).not.toContain('Resets at');
++  expect(html).not.toContain('NaN');
++  expect(html).not.toContain('Infinity');
++  expect(html).toContain('https://platform.xiaomimimo.com/#/console/plan-manage');
++  expect(html).toContain('<button');
++});
++test('unconfigured, auth expiry, unavailable, stale, expired and exhausted remain distinct', () => {
++  expect(render({ kind: 'unconfigured' })).toContain('Not configured');
++  expect(render({ kind: 'unavailable' })).toContain('Unavailable');
++  expect(
++    render({ kind: 'ready', snapshot: { ...sample, error: 'auth_required', stale: true } })
++  ).toContain('Session required');
++  expect(render({ kind: 'ready', snapshot: sample }, Date.parse('2030-01-01T00:11:00Z'))).toContain(
++    'Stale'
++  );
++  expect(render({ kind: 'ready', snapshot: { ...sample, expired: true } })).toContain('Expired');
++  const exhausted = structuredClone(sample);
++  exhausted.pools[0] = {
++    ...exhausted.pools[0],
++    used: '11000000000',
++    remaining: '0',
++    remainingPercent: '0.00',
++  };
++  const html = render({ kind: 'ready', snapshot: exhausted });
++  expect(html).toContain('0.00%');
++  expect(html).not.toContain('Not configured');
++});
