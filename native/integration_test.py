@@ -24,7 +24,8 @@ def stamp(minutes=0):
     return (datetime.now(timezone.utc) + timedelta(minutes=minutes)).isoformat(timespec='milliseconds').replace('+00:00', 'Z')
 # v0.3.0 collector additions; host label and command are synthetic.
 def session(state='ok', rejected=None):
-    return {'state': state, 'updatedAt': stamp(-180), 'rejectedAt': rejected, 'lastAttemptAt': stamp(-1), 'nextAttemptAt': stamp(4)}
+    # No Xiaomi attempt is scheduled while the file is missing or invalid.
+    return {'state': state, 'updatedAt': stamp(-180), 'rejectedAt': rejected, 'lastAttemptAt': stamp(-1), 'nextAttemptAt': None if state in ('missing', 'invalid_file') else stamp(4)}
 def renewal(result='not_needed', command=None):
     return {'checkedAt': stamp(-2), 'result': result, 'renewedAt': stamp(-180), 'host': 'synthetic-host', 'manualCommand': command}
 class Collector(BaseHTTPRequestHandler):
@@ -149,6 +150,15 @@ plugins:
                 for want in ('Xiaomi rejected the collector session', 'Renewal agent on synthetic-host', 'not signed in', f'Run on synthetic-host: `{command}`', 'Details: Plugins'):
                     assert want in text, (want, text)
                 assert len(text.encode()) <= 400 + len('failed to fetch quota: '), text
+                # Account mismatch (refresher refused another Xiaomi account) on a missing file with no scheduled attempt.
+                fixture.update(session=session('missing', stamp(-30)), renewal=renewal('account_mismatch', command))
+                status, body, _ = request(route); data = json.loads(body)
+                assert status == 200 and data['session']['nextAttemptAt'] is None and data['renewal']['result'] == 'account_mismatch', (status, data)
+                status, body, _ = request('/v0/management/quota/fetch', {'auth_index': index})
+                text = json.loads(body)['error']
+                for want in ('session file is missing', 'different Xiaomi account', 'no account id', '--rebind', 'Details: Plugins'):
+                    assert status == 502 and want in text, (want, status, text)
+                assert len(text.encode()) <= 400 + len('failed to fetch quota: '), text
                 # Invalid renewal data fails closed for the whole snapshot.
                 fixture['renewal'] = dict(renewal(), host='.bad host')
                 assert request(route)[0] == 503 and request('/v0/management/quota/fetch', {'auth_index': index})[0] == 502
@@ -158,7 +168,7 @@ plugins:
                 status, body, _ = request(route); data = json.loads(body)
                 assert status == 200 and 'session' not in data and 'renewal' not in data, data
                 assert request('/v0/management/quota/fetch', {'auth_index': index})[0] == 200
-            print(json.dumps({'realCABI': True, 'registeredAndLoaded': True, 'publicShellOnly': True, 'unauthenticatedSnapshot': 401, 'quotaFraction': .4, 'authFailureRecovery': True, 'sessionRenewalPassThrough': True, 'expiredSessionGuidance': True, 'invalidRenewalFailsClosed': True, 'oldCollectorShape': True, 'syntheticOnly': True}))
+            print(json.dumps({'realCABI': True, 'registeredAndLoaded': True, 'publicShellOnly': True, 'unauthenticatedSnapshot': 401, 'quotaFraction': .4, 'authFailureRecovery': True, 'sessionRenewalPassThrough': True, 'expiredSessionGuidance': True, 'accountMismatchGuidance': True, 'invalidRenewalFailsClosed': True, 'oldCollectorShape': True, 'syntheticOnly': True}))
         finally:
             collector.shutdown(); collector.server_close()
 

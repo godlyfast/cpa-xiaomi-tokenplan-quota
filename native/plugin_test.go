@@ -230,7 +230,7 @@ func TestSessionAndRenewalAreValidatedStrictly(t *testing.T) {
 			t.Fatalf("state %s rejected", state)
 		}
 	}
-	for _, result := range []string{"not_needed", "renewed", "signin_required", "browser_unavailable", "vendor_unavailable", "error"} {
+	for _, result := range []string{"not_needed", "renewed", "signin_required", "browser_unavailable", "vendor_unavailable", "account_mismatch", "error"} {
 		if _, err := decodeSnapshot([]byte(edit(t, fixture, map[string]any{"renewal": renewalBlock(result, "2026-10-27T12:00:00.000Z", nil)})), testTime); err != nil {
 			t.Fatalf("result %s rejected", result)
 		}
@@ -248,6 +248,7 @@ func TestSessionAndRenewalAreValidatedStrictly(t *testing.T) {
 		"session-number":    {"session": with(ok, "updatedAt", 1761555600000)},
 		"renewal-type":      {"renewal": []any{}},
 		"renewal-result":    {"renewal": with(renewal, "result", "ok")},
+		"renewal-mismatch":  {"renewal": with(renewal, "result", "Account_Mismatch")},
 		"renewal-checked":   {"renewal": with(renewal, "checkedAt", nil)},
 		"renewal-missing":   {"renewal": with(renewal, "checkedAt", absent)},
 		"renewal-renewed":   {"renewal": with(renewal, "renewedAt", "yesterday")},

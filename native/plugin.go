@@ -33,7 +33,7 @@ var unavailable = errors.New("collector unavailable")
 var utcStamp = regexp.MustCompile(`^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d{1,3})?Z$`)
 var hostLabel = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
 var sessionStates = map[string]bool{"unknown": true, "ok": true, "expired": true, "missing": true, "invalid_file": true}
-var renewalResults = map[string]bool{"not_needed": true, "renewed": true, "signin_required": true, "browser_unavailable": true, "vendor_unavailable": true, "error": true}
+var renewalResults = map[string]bool{"not_needed": true, "renewed": true, "signin_required": true, "browser_unavailable": true, "vendor_unavailable": true, "account_mismatch": true, "error": true}
 
 type config struct {
 	CollectorURL string `yaml:"collector_url"`
@@ -353,6 +353,10 @@ func explain(s snapshot, now time.Time) string {
 	case s.Error != nil && *s.Error == "schema_changed":
 		return message("Xiaomi's console API changed: the collector rejected an unexpected response"+opt(" at ", attempt, "")+".", "Quota stays unavailable until the collector code is updated; check the plugin repository for a release.", last)
 	case s.Error != nil:
+		// A due or overdue nextAttemptAt only means "on the next poll"; never print a past time as next.
+		if at, err := time.Parse(time.RFC3339Nano, deref(next)); err != nil || !at.After(now) {
+			next = nil
+		}
 		return message("The collector could not reach Xiaomi (or got a non-auth error) on its last attempt"+opt(" at ", attempt, "")+"; it retries every 5 min"+opt(", next ~", next, "")+".", last, "If this persists, check the collector's outbound network.")
 	case s.Expired != nil && *s.Expired:
 		head := "Xiaomi reports the Token Plan subscription as expired" + opt(" (listed expiry ", s.ExpiresAt, ")") + "."
@@ -367,21 +371,33 @@ func explain(s snapshot, now time.Time) string {
 func explainSession(s snapshot, now time.Time, last string) string {
 	v := s.Session
 	if v == nil {
-		return message("Xiaomi rejected the collector session or the collector cannot read its session file (~24 h lifetime).", "Replace the session file with fresh cookies from a browser signed in to the Xiaomi console, then restart this pre-0.3.0 collector: it stops polling after a rejection.", last)
+		return message("Xiaomi rejected the collector session or the collector cannot read its session file (sessions have lasted ~24 h).", "Replace the session file with fresh cookies from a browser signed in to the Xiaomi console, then restart this pre-0.3.0 collector: it stops polling after a rejection.", last)
 	}
-	head, fix := "Xiaomi rejected the collector session"+opt(" at ", v.RejectedAt, "")+" (~24 h lifetime).", ""
+	head, fix := "Xiaomi rejected the collector session"+opt(" at ", v.RejectedAt, "")+" (sessions have lasted ~24 h).", ""
 	switch v.State {
 	case "missing":
-		head, fix = "The collector's Xiaomi session file is missing"+opt(" (since ", v.RejectedAt, ")")+".", "It must be an owner-only regular file holding one Cookie header line."
+		head, fix = "The collector's Xiaomi session file is missing"+opt(" (since ", v.RejectedAt, ")")+".", "The session file must be an owner-only regular file with one printable-ASCII Cookie header line."
 	case "invalid_file":
-		head, fix = "The collector cannot use its Xiaomi session file"+opt(" (since ", v.RejectedAt, ")")+".", "It must be an owner-only regular file (no symlink) owned by the collector user, holding one Cookie header line."
+		head, fix = "The collector cannot use its Xiaomi session file"+opt(" (since ", v.RejectedAt, ")")+".", "The session file must be an owner-only regular file (no symlink) owned by the collector user, with one printable-ASCII Cookie header line."
 	}
-	agent, run := renewalAdvice(v, s.Renewal, now)
-	return message(head, fix, agent, run, "The collector resumes within seconds of a new session file.", last)
+	core, extra := renewalAdvice(v, s.Renewal, now)
+	parts := []string{head}
+	if s.Renewal == nil {
+		parts = append(append(parts, fix), core...)
+	} else {
+		// A reporting agent's cause and action outrank the file requirements when space runs out.
+		parts = append(append(parts, core...), fix)
+	}
+	return message(append(append(parts, extra...), last)...)
 }
-func renewalAdvice(v *sessionInfo, r *renewalInfo, now time.Time) (string, string) {
+
+const resumes = "The collector resumes within seconds of a new session file."
+
+// Renewal-agent sentences: the essential ones, then optional ones. message() drops whatever no longer fits.
+func renewalAdvice(v *sessionInfo, r *renewalInfo, now time.Time) ([]string, []string) {
 	if r == nil {
-		return "No renewal agent reports: run refresher/refresh-session.ts where a browser is signed in to the Xiaomi console, or replace the session file.", ""
+		// A pre-0.3.0 single-file bind keeps the old inode and never shows the status file, so it always lands here.
+		return []string{"No renewal agent reports: run refresher/refresh-session.ts where a browser is signed in to the Xiaomi console, or replace the session file.", "The collector resumes within seconds of a new file; a pre-0.3.0 single-file mount needs a restart or the directory mount."}, nil
 	}
 	checked, _ := time.Parse(time.RFC3339Nano, r.CheckedAt)
 	on, at, run := "Renewal agent on "+r.Host, utc(r.CheckedAt), ""
@@ -389,11 +405,12 @@ func renewalAdvice(v *sessionInfo, r *renewalInfo, now time.Time) (string, strin
 		run = "Run on " + r.Host + ": `" + *r.ManualCommand + "`."
 	}
 	if now.Sub(checked) > 15*time.Minute {
-		return on + " last reported at " + at + " (" + r.Result + "): host likely asleep or its timer stopped.", run
+		// No new report: asleep or stopped, or it runs but its status read or write fails (it then writes nothing).
+		return []string{on + " silent since " + at + ": host asleep or timer stopped, or it cannot reach the collector or write its status (ssh/sudo/Docker/dir).", "Run it with --check there and read its unit journal."}, []string{"Or replace the session file by hand.", run, resumes}
 	}
 	if v.RejectedAt != nil {
 		if rejected, _ := time.Parse(time.RFC3339Nano, *v.RejectedAt); checked.Before(rejected) {
-			return on + " last checked at " + at + ", before the rejection; its next run should renew the session.", run
+			return []string{on + " last checked at " + at + ", before the rejection; its next run should renew the session."}, []string{run, resumes}
 		}
 	}
 	switch r.Result {
@@ -401,17 +418,19 @@ func renewalAdvice(v *sessionInfo, r *renewalInfo, now time.Time) (string, strin
 		if r.RenewedAt != nil {
 			at = utc(*r.RenewedAt)
 		}
-		return on + " installed a new session at " + at + "; waiting for the collector to pick it up.", ""
+		return []string{on + " installed a new session at " + at + "; waiting for the collector to pick it up."}, []string{resumes}
 	case "signin_required":
-		return on + " (" + at + "): browser not signed in to Xiaomi; sign in at the Xiaomi console there, then rerun the refresher.", run
+		return []string{on + " (" + at + "): browser not signed in to Xiaomi; sign in at the Xiaomi console there, then rerun the refresher."}, []string{run, resumes}
 	case "browser_unavailable":
-		return on + " (" + at + "): renewal browser is not running; start it, then rerun the refresher.", run
+		return []string{on + " (" + at + "): renewal browser is not running; start it, then rerun the refresher."}, []string{run, resumes}
 	case "vendor_unavailable":
-		return on + " (" + at + ") could not reach Xiaomi; it retries on its next run.", run
+		return []string{on + " (" + at + ") could not reach Xiaomi; it retries on its next run."}, []string{run, resumes}
+	case "account_mismatch":
+		return []string{on + " refused: its browser is signed in to a different Xiaomi account than the collector session, or that has no account id.", "Sign that browser into the bound account and rerun, or use --rebind and update the collector's account label."}, []string{run, resumes}
 	case "not_needed":
-		return on + " (" + at + ") reported the collector healthy; its next run should notice the rejection and renew.", run
+		return []string{on + " (" + at + ") saw no session rejection; its next run should renew."}, []string{run, resumes}
 	default:
-		return on + " (" + at + ") failed unexpectedly; check its output, then rerun the refresher.", run
+		return []string{on + " (" + at + ") failed unexpectedly; check its output, then rerun the refresher."}, []string{run, resumes}
 	}
 }
 func normalize(s snapshot) map[string]any {
