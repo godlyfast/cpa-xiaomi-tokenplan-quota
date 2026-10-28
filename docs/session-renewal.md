@@ -274,12 +274,12 @@ umask 077; d=/srv/xiaomi-quota/session; t=
 printf 'Cookie header value: ' >&2
 if IFS= read -rs c && case $c in *userId=?*) true;; *) false;; esac &&
   printf '%s' "$c" | LC_ALL=C grep -qv '[^ -~]' &&
-  t=$(mktemp "$d/.mimo_session.XXXXXXXX") && printf '%s\n' "$c" > "$t" &&
+  t=$(mktemp "$d/.mimo_session.XXXXXXXX") && printf '%s\n' "$c" >| "$t" &&
   chmod 600 "$t" && mv -fT "$t" "$d/mimo_session"
 then echo; echo installed; else echo; [ -z "$t" ] || rm -f "$t"; echo 'not installed' >&2; fi; unset c t
 ```
 
-Paste the block and press Enter. When it prints `Cookie header value:` and waits without echo, paste the value and press Enter. Ctrl-D, an empty line or an unusable value prints `not installed`. The check is a shape check only: Xiaomi has not validated the value, and the collector still applies its own file rules. Verified in interactive bash 5.3 and zsh 5.9 (C and UTF-8 locales): a synthetic value was installed with mode 0600 and appeared in neither the terminal output nor the history file.
+Paste the block and press Enter. When it prints `Cookie header value:` and waits without echo, paste the value and press Enter. Ctrl-D, an empty line or an unusable value prints `not installed`. The check is a shape check only: Xiaomi has not validated the value, and the collector still applies its own file rules. Verified in interactive bash 5.3 and zsh 5.9 (C and UTF-8 locales, with and without `noclobber`): a synthetic value was installed with mode 0600 and appeared in neither the terminal output nor the history file.
 
 A blocked collector loads it within the session-check interval and a healthy one on its next poll; no restart (with the directory mount).
 
