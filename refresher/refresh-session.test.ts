@@ -1519,7 +1519,7 @@ test("entrypoint: SIGTERM/SIGINT close the owned target and exit 128+signal", as
       `#!/bin/sh\ncase "$*" in *"'sudo'"*) cat "${dir}/status.json" ;; *) cat > /dev/null; echo write >> "${dir}/writes" ;; esac\n`,
       { mode: 0o700 },
     );
-    for (const [signal, code] of [["SIGTERM", 143], ["SIGINT", 130]] as const) {
+    for (const [signal, code] of [["SIGTERM", 143], ["SIGINT", 130], ["SIGHUP", 129]] as const) {
       let navigated!: () => void;
       const onNavigate = new Promise<void>((resolve) => (navigated = resolve));
       const fake = cdpServer((m, reply) => {
