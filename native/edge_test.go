@@ -77,20 +77,23 @@ func TestQuotaFetchFailuresAreSpecificAndActionable(t *testing.T) {
 		later      time.Duration
 		want, not  []string
 	}{
-		{"expired-no-agent", edit(t, auth, map[string]any{"session": expired}), 0, []string{"rejected the collector session at 2026-10-27T11:00:00Z", "~24 h", "refresher/refresh-session.ts", "signed in to the Xiaomi console", "resumes within seconds of a new session file", "Last good quota: 2026-10-27T12:00:00Z"}, []string{"restart"}},
-		{"expired-signin", edit(t, auth, agent("signin_required", "2026-10-27T11:58:00.000Z")), 0, []string{"Renewal agent on synthetic-host", "11:58:00Z", "not signed in", "sign in at the Xiaomi console", "Run on synthetic-host: `bun refresher/refresh-session.ts`.", "resumes within seconds"}, nil},
+		{"expired-no-agent", edit(t, auth, map[string]any{"session": expired}), 0, []string{"rejected the collector session at 2026-10-27T11:00:00Z", "sessions have lasted ~24 h", "refresher/refresh-session.ts", "signed in to the Xiaomi console", "resumes within seconds of a new file", "a pre-0.3.0 single-file mount needs a restart or the directory mount"}, []string{"lifetime", "then restart"}},
+		{"expired-signin", edit(t, auth, agent("signin_required", "2026-10-27T11:58:00.000Z")), 0, []string{"Renewal agent on synthetic-host", "11:58:00Z", "not signed in", "sign in at the Xiaomi console", "Run on synthetic-host: `bun refresher/refresh-session.ts`."}, nil},
 		{"expired-renewed", edit(t, auth, map[string]any{"session": expired, "renewal": with(renewalBlock("renewed", "2026-10-27T11:58:00.000Z", "bun refresher/refresh-session.ts"), "renewedAt", "2026-10-27T11:57:59.000Z")}), 0, []string{"installed a new session at 2026-10-27T11:57:59Z", "waiting for the collector"}, []string{"Run on"}},
 		{"expired-browser", edit(t, auth, agent("browser_unavailable", "2026-10-27T11:58:00.000Z")), 0, []string{"renewal browser is not running", "start it"}, nil},
 		{"expired-vendor", edit(t, auth, agent("vendor_unavailable", "2026-10-27T11:58:00.000Z")), 0, []string{"could not reach Xiaomi", "next run"}, nil},
 		{"expired-error", edit(t, auth, agent("error", "2026-10-27T11:58:00.000Z")), 0, []string{"failed unexpectedly", "rerun"}, nil},
-		{"expired-not-needed", edit(t, auth, agent("not_needed", "2026-10-27T11:58:00.000Z")), 0, []string{"reported the collector healthy", "next run should notice"}, nil},
-		{"expired-agent-stale", edit(t, auth, agent("not_needed", "2026-10-27T10:30:00.000Z")), 0, []string{"last reported at 2026-10-27T10:30:00Z", "asleep", "timer"}, nil},
+		{"expired-not-needed", edit(t, auth, agent("not_needed", "2026-10-27T11:58:00.000Z")), 0, []string{"saw no session rejection", "next run should renew"}, []string{"healthy"}},
+		{"expired-account-mismatch", edit(t, auth, agent("account_mismatch", "2026-10-27T11:58:00.000Z")), 0, []string{"Renewal agent on synthetic-host refused", "signed in to a different Xiaomi account than the collector session", "no account id", "Sign that browser into the bound account and rerun", "--rebind", "update the collector's account label"}, []string{"failed unexpectedly", "installed", "renew"}},
+		{"expired-agent-stale", edit(t, auth, agent("not_needed", "2026-10-27T10:30:00.000Z")), 0, []string{"silent since 2026-10-27T10:30:00Z", "asleep", "timer", "cannot reach the collector or write its status", "ssh/sudo/Docker", "--check", "unit journal", "replace the session file by hand"}, []string{"renews the session", "likely"}},
 		{"expired-agent-before-rejection", edit(t, auth, map[string]any{"session": sessionBlock("expired", "2026-10-27T11:59:00.000Z"), "renewal": renewalBlock("not_needed", "2026-10-27T11:55:00.000Z", nil)}), 0, []string{"before the rejection", "next run"}, nil},
-		{"missing", edit(t, auth, map[string]any{"session": sessionBlock("missing", "2026-10-27T11:00:00.000Z")}), 0, []string{"session file is missing", "since 2026-10-27T11:00:00Z", "owner-only regular file", "Cookie header"}, nil},
-		{"invalid-file", edit(t, auth, map[string]any{"session": sessionBlock("invalid_file", "2026-10-27T11:00:00.000Z")}), 0, []string{"cannot use its Xiaomi session file", "owner-only regular file", "symlink"}, nil},
-		{"old-collector-auth", auth, 0, []string{"rejected", "~24 h", "restart", "pre-0.3.0"}, nil},
+		{"missing", edit(t, auth, map[string]any{"session": with(sessionBlock("missing", "2026-10-27T11:00:00.000Z"), "nextAttemptAt", nil)}), 0, []string{"session file is missing", "since 2026-10-27T11:00:00Z", "owner-only regular file", "Cookie header"}, []string{"lifetime"}},
+		{"invalid-file", edit(t, auth, map[string]any{"session": sessionBlock("invalid_file", "2026-10-27T11:00:00.000Z")}), 0, []string{"cannot use its Xiaomi session file", "owner-only regular file", "symlink", "printable-ASCII"}, nil},
+		{"old-collector-auth", auth, 0, []string{"rejected", "sessions have lasted ~24 h", "restart", "pre-0.3.0"}, []string{"lifetime"}},
 		{"schema-changed", edit(t, fixture, map[string]any{"stale": true, "error": "schema_changed", "session": sessionBlock("ok", nil)}), 0, []string{"API changed", "at 2026-10-27T12:00:30Z", "collector code is updated"}, []string{"session file"}},
-		{"unavailable", edit(t, fixture, map[string]any{"stale": true, "error": "unavailable", "session": sessionBlock("ok", nil)}), 0, []string{"could not reach Xiaomi", "at 2026-10-27T12:00:30Z", "retries every 5 min", "2026-10-27T12:05:30Z"}, nil},
+		{"unavailable", edit(t, fixture, map[string]any{"stale": true, "error": "unavailable", "session": sessionBlock("ok", nil)}), 0, []string{"could not reach Xiaomi", "at 2026-10-27T12:00:30Z", "retries every 5 min", "next ~2026-10-27T12:05:30Z"}, nil},
+		{"unavailable-next-due", edit(t, fixture, map[string]any{"stale": true, "error": "unavailable", "session": sessionBlock("ok", nil)}), 5 * time.Minute, []string{"could not reach Xiaomi", "retries every 5 min."}, []string{"next ~"}},
+		{"unavailable-next-null", edit(t, fixture, map[string]any{"stale": true, "error": "unavailable", "session": with(sessionBlock("unknown", nil), "nextAttemptAt", nil)}), 0, []string{"retries every 5 min."}, []string{"next ~"}},
 		{"unavailable-first-poll", edit(t, fixture, map[string]any{"stale": true, "error": "unavailable", "pools": []any{}, "fetchedAt": nil, "expired": nil}), 0, []string{"could not reach Xiaomi", "No quota fetched yet"}, nil},
 		{"stale-no-error", fixture, time.Hour, []string{"No completed collector poll in over 10 min", "Last good quota: 2026-10-27T12:00:00Z", "running", "clock"}, nil},
 		{"subscription-expired", edit(t, fixture, map[string]any{"expiresAt": "2026-10-27T11:00:00Z"}), 0, []string{"subscription expired at 2026-10-27T11:00:00Z", "Renew", "Xiaomi console"}, nil},
@@ -139,5 +142,29 @@ func TestQuotaFetchMessageStaysBoundedForLongestValidFields(t *testing.T) {
 	m := fetchFailure(t, p)
 	if !strings.HasPrefix(m, "Xiaomi rejected the collector session at 2026-10-27T11:00:00Z") || !strings.Contains(m, "Renewal agent on h"+strings.Repeat("x", 63)) {
 		t.Fatalf("essential guidance dropped: %s", m)
+	}
+	// Each branch's cause and fix must survive the longest host, command and state head.
+	for name, test := range map[string]struct {
+		state, result, checkedAt string
+		want                     []string
+	}{
+		"stale":            {"invalid_file", "account_mismatch", "2026-10-27T10:00:00.000Z", []string{"cannot reach the collector or write its status", "--check", "unit journal"}},
+		"account-mismatch": {"missing", "account_mismatch", "2026-10-27T11:58:00.000Z", []string{"different Xiaomi account", "no account id"}},
+		"not-needed":       {"invalid_file", "not_needed", "2026-10-27T11:58:00.000Z", []string{"saw no session rejection"}},
+	} {
+		r := renewalBlock(test.result, test.checkedAt, strings.Repeat("x", 160))
+		r["host"] = "h" + strings.Repeat("x", 63)
+		m := fetchFailure(t, testPlugin(t, edit(t, fixture, map[string]any{"stale": true, "error": "auth_required", "session": sessionBlock(test.state, "2026-10-27T11:00:00.000Z"), "renewal": r})))
+		for _, want := range test.want {
+			if !strings.Contains(m, want) {
+				t.Errorf("%s: dropped %q: %s", name, want, m)
+			}
+		}
+	}
+	m = fetchFailure(t, testPlugin(t, edit(t, fixture, map[string]any{"stale": true, "error": "auth_required", "session": sessionBlock("invalid_file", "2026-10-27T11:00:00.000Z")})))
+	for _, want := range []string{"cannot use its Xiaomi session file", "printable-ASCII Cookie header line", "No renewal agent reports"} {
+		if !strings.Contains(m, want) {
+			t.Errorf("no-agent: dropped %q: %s", want, m)
+		}
 	}
 }

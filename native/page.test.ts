@@ -119,8 +119,9 @@ async function render(snapshot: unknown) {
 test("healthy session shows a compact session and renewal summary", async () => {
   const p = await render(v3());
   expect(p.help).toContain("Session & renewal"); expect(p.help).toContain("Session OK");
-  expect(p.help).toContain("session file updated 3 h ago ("); expect(p.help).toContain("about 24 h");
-  expect(p.help).toContain("Renewal agent on synthetic-host: last check 4 min ago ("); expect(p.help).toContain("last renewal 3 h ago");
+  expect(p.help).toContain("session file updated 3 h ago ("); expect(p.help).toContain("Xiaomi console sessions have lasted about 24 h");
+  expect(p.help).toContain("Renewal agent on synthetic-host: last check 4 min ago ("); expect(p.help).toContain("no renewal needed (no rejection reported); last renewal 3 h ago");
+  expect(p.help).not.toContain("healthy"); expect(p.help).not.toContain("sessions last about");
   expect(p.help).not.toContain("What to do"); expect(p.status).toContain("Fresh");
   expect(p.get("quota").children.length).toBeGreaterThan(0);
 });
@@ -128,11 +129,16 @@ test("healthy session without a renewal agent says nothing renews it", async () 
   for (const renewal of [null, undefined]) {
     const p = await render(v3({ renewal }));
     expect(p.help).toContain("No renewal agent reporting"); expect(p.help).toContain("Session OK");
+    expect(p.help).toContain("(pre-0.3.0 layout)"); expect(p.help).toContain("switch to the directory mount");
   }
 });
 test("healthy session warns early when the renewal agent cannot renew", async () => {
   let p = await render(v3({ renewal: agent("not_needed", iso(-40 * MIN)) }));
   expect(p.help).toContain("40 min ago"); expect(p.help).toContain("asleep");
+  for (const want of ["cannot reach the collector or write its status", "run the refresher with --check on synthetic-host and read its unit journal"]) expect(p.help).toContain(want);
+  expect(p.help).not.toContain("until it runs again");
+  p = await render(v3({ renewal: agent("account_mismatch") }));
+  for (const want of ["last check 2 min ago (", "renewal refused: browser signed in to a different Xiaomi account; last renewal", "different Xiaomi account than the collector's current session", "no account id", "--rebind", "before the current session expires"]) expect(p.help).toContain(want);
   p = await render(v3({ renewal: agent("signin_required") }));
   expect(p.help).toContain("Sign in at the Xiaomi console"); expect(p.help).toContain("synthetic-host before the current session expires");
   p = await render(v3({ renewal: agent("browser_unavailable") }));
@@ -140,28 +146,41 @@ test("healthy session warns early when the renewal agent cannot renew", async ()
 });
 test("rejected session explains what happened and what to do for every renewal state", async () => {
   const cases: [string, unknown, string[]][] = [
-    ["no agent", null, ["No renewal agent is reporting", "refresher/refresh-session.ts", "signed in to the Xiaomi console", "replace the session file by hand"]],
+    ["no agent", null, ["No renewal agent is reporting", "refresher/refresh-session.ts", "signed in to the Xiaomi console", "replace the session file by hand", "still mounts the single session file rather than its directory (pre-0.3.0 layout)", "switch to the directory mount or restart the collector"]],
     ["renewed", agent("renewed"), ["installed a new session 2 min ago", "waiting for the collector to pick it up", "whole session directory"]],
     ["signin", agent("signin_required"), ["At its last check 2 min ago (", "found its browser not signed in to Xiaomi", "On synthetic-host, sign in at the Xiaomi console", "then rerun the session refresher there", "Run on synthetic-host:"]],
     ["browser", agent("browser_unavailable"), ["could not reach the renewal browser", "Start the renewal browser on synthetic-host"]],
     ["vendor", agent("vendor_unavailable"), ["could not reach Xiaomi", "next run"]],
     ["error", agent("error"), ["failed unexpectedly", "output on synthetic-host"]],
-    ["not needed", agent("not_needed"), ["reported the collector healthy, so it did not renew", "clocks differ", "Wait for the next renewal run on synthetic-host", "Run on synthetic-host: "]],
-    ["stale agent", agent("signin_required", iso(-40 * MIN)), ["last reported 40 min ago (", "— browser not signed in to Xiaomi", "asleep or its renewal timer stopped"]],
+    ["not needed", agent("not_needed"), ["saw no session rejection, so it did not renew", "clocks differ", "Wait for the next renewal run on synthetic-host", "Run on synthetic-host: "]],
+    ["account mismatch", agent("account_mismatch"), ["At its last check 2 min ago (", "refused to install a new session", "renewal browser is signed in to a different Xiaomi account than the collector's current session", "or that session has no account id. The collector's session file was not changed.", "On synthetic-host, sign the renewal browser into the Xiaomi account the collector is bound to", "then rerun the session refresher there", "--rebind", "ACCOUNT_LABEL", "Run on synthetic-host: "]],
+    ["stale agent", agent("signin_required", iso(-40 * MIN)), ["last reported 40 min ago (", "— browser not signed in to Xiaomi", "asleep or its renewal timer stopped", "runs but cannot reach the collector or write its status (ssh, sudo, Docker or the remote session directory)", "run the refresher with --check on synthetic-host and read its unit journal", "replace the session file by hand"]],
   ];
   for (const [name, renewal, wants] of cases) {
     const p = await render(rejected(renewal));
-    for (const want of ["What happened", "What to do", "Xiaomi rejected the collector's console session 1 h ago (", "last replaced 25 h ago (", "about 24 h", "last known, fetched 2 h ago", ...wants]) {
+    for (const want of ["What happened", "What to do", "Xiaomi rejected the collector's console session 1 h ago (", "last replaced 25 h ago (", "Xiaomi console sessions have lasted about 24 h", "last known, fetched 2 h ago", ...wants]) {
       if (!p.help.includes(want)) throw Error(`${name}: missing ${JSON.stringify(want)} in ${p.help}`);
     }
     expect(p.status).toContain("Xiaomi session rejected");
     expect(p.get("quota").children.length).toBeGreaterThan(0);
     if (name !== "renewed") expect(p.help).toContain("reloads a replaced session file within about 15 s");
+    for (const bad of ["its next run renews the session", "reported the collector healthy", "sessions last about"]) expect(p.help).not.toContain(bad);
   }
   const pending = await render(rejected(agent("not_needed", iso(-8 * MIN)), "expired", iso(-5 * MIN)));
   expect(pending.help).toContain("last checked 8 min ago"); expect(pending.help).toContain("its next run should install a new session");
-  const retry = await render({ ...rejected(null), session: { ...rejected(null).session, nextAttemptAt: iso(4 * MIN) } });
-  expect(retry.help).toContain("otherwise it next contacts Xiaomi in 4 min (");
+  const next = (state: string, nextAttemptAt: string | null) => render({ ...rejected(null, state), session: { ...rejected(null, state).session, nextAttemptAt } });
+  expect((await next("expired", iso(4 * MIN))).help).toContain("otherwise it next contacts Xiaomi in 4 min (");
+  // Due or overdue retries happen on the next poll tick, never "ago".
+  for (const due of [iso(-3 * MIN), iso(10_000), iso(-2 * H)]) {
+    const p = await next("expired", due);
+    expect(p.help).toContain("otherwise it next contacts Xiaomi at its next 5-minute poll."); expect(p.help).not.toMatch(/next contacts Xiaomi (in|just|\d)/);
+  }
+  expect((await next("expired", null)).help).not.toContain("next contacts Xiaomi");
+  // A missing or unusable file is never sent: only a file change triggers an attempt, whatever nextAttemptAt says.
+  for (const state of ["missing", "invalid_file"]) for (const at of [null, iso(4 * MIN), iso(-2 * H)]) {
+    const p = await next(state, at);
+    expect(p.help).not.toContain("next contacts Xiaomi"); expect(p.help).toContain("does not contact Xiaomi; only a change to the session file triggers a new attempt");
+  }
 });
 test("manual renewal command renders verbatim as code text", async () => {
   const command = `bun refresher/refresh-session.ts --label "<b>synthetic</b>" && echo '&amp;'`;
@@ -174,10 +193,10 @@ test("manual renewal command renders verbatim as code text", async () => {
 test("missing and unusable session files explain the file requirements", async () => {
   let p = await render(rejected(agent("not_needed"), "missing"));
   expect(p.status).toContain("Session file missing");
-  expect(p.help).toContain("cannot find its Xiaomi session file. First noticed 1 h ago ("); expect(p.help).toContain("owner-only"); expect(p.help).toContain("reported the collector healthy");
+  expect(p.help).toContain("cannot find its Xiaomi session file. First noticed 1 h ago ("); expect(p.help).toContain("owner-only"); expect(p.help).toContain("saw no session rejection");
   p = await render(rejected(null, "invalid_file"));
   expect(p.status).toContain("Session file unusable");
-  expect(p.help).toContain("cannot use its Xiaomi session file"); expect(p.help).toContain("not a symlink"); expect(p.help).toContain("one Cookie header line");
+  expect(p.help).toContain("cannot use its Xiaomi session file"); expect(p.help).toContain("not a symlink"); expect(p.help).toContain("one Cookie header line of printable ASCII");
 });
 test("older collectors without session details get generic restart guidance", async () => {
   const { session: _s, renewal: _r, ...old } = rejected(null);
@@ -191,6 +210,12 @@ test("vendor, network, staleness and subscription problems get specific guidance
   expect(p.help).toContain("does not understand"); expect(p.help).toContain("updated collector release"); expect(p.help).toContain("Session OK"); expect(p.status).toContain("Vendor response changed");
   p = await render(v3({ stale: true, error: "unavailable" }));
   expect(p.help).toContain("on its last attempt, 2 min ago ("); expect(p.help).toContain("retries every 5 min; next attempt in 3 min ("); expect(p.status).toContain("Xiaomi unreachable");
+  p = await render(v3({ stale: true, error: "unavailable", session: { ...v3().session, nextAttemptAt: iso(-1 * MIN) } }));
+  expect(p.help).toContain("retries every 5 min."); expect(p.help).not.toContain("next attempt");
+  // A replaced session tried once with a non-auth failure is unverified, and not_needed only means no rejection was seen.
+  p = await render(v3({ stale: true, error: "unavailable", session: { ...v3().session, state: "unknown" } }));
+  expect(p.help).toContain("Session not verified yet"); expect(p.help).toContain("no renewal needed (no rejection reported)");
+  expect(p.help).not.toContain("not checked yet"); expect(p.help).not.toContain("healthy");
   p = await render(v3({ stale: true, fetchedAt: iso(-20 * MIN) }));
   expect(p.help).toContain("more than 10 min"); expect(p.help).toContain("20 min ago"); expect(p.status).toContain("STALE");
   p = await render(v3({ expired: true, expiresAt: iso(-1 * H) }));
@@ -218,6 +243,8 @@ test("page source never writes HTML and links only to the Xiaomi console", () =>
   expect(html.match(/https?:\/\//g)).toHaveLength(1);
   expect(html).toContain('<a href="https://platform.xiaomimimo.com/#/console/plan-manage" target="_blank" rel="noopener noreferrer">Xiaomi console</a>');
   expect(html).not.toContain("Reauthentication of the Xiaomi session is a separate operator action");
+  // Session lifetime is an observation, not a vendor guarantee.
+  expect(html).toContain("Xiaomi console sessions have lasted about 24 h"); expect(html).not.toMatch(/sessions last about|about every 24 h/);
 });
 test("relative times cover just now, minutes, hours and days alongside UTC", async () => {
   const updatedAt = iso(-10_000), renewedAt = iso(-3 * 24 * H);
