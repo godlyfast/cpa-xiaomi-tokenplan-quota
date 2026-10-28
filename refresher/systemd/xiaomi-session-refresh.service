@@ -3,12 +3,19 @@
 # systemctl --user enable --now xiaomi-session-refresh.timer
 # ssh runs with BatchMode=yes: key auth only, known_hosts already trusted, and
 # an unencrypted key or an SSH_AUTH_SOCK agent visible to the user manager.
+# The timer never passes --rebind, so a renewal only replaces a session of the
+# same Xiaomi account (userId); otherwise it reports account_mismatch (exit 3).
+# The first install (no session on the collector host yet) and a deliberate
+# account switch need one manual run with this environment plus --rebind
+# (add --force if the collector is healthy); then update ACCOUNT_LABEL.
+# The run stops itself after 100 s, closes its tab and writes its status
+# (at most ~125 s in total); SIGTERM closes the tab before exiting.
 [Unit]
 Description=Renew the Xiaomi MiMo collector session from the signed-in renewal browser
 
 [Service]
 Type=oneshot
-TimeoutStartSec=120
+TimeoutStartSec=150
 Environment=PATH=%h/.bun/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 Environment=XQ_CDP_URL=http://127.0.0.1:9223
 Environment=XQ_SSH_TARGET=user@collector-host.example

@@ -18,12 +18,14 @@ export type RenewalResult =
   | "signin_required"
   | "browser_unavailable"
   | "vendor_unavailable"
+  | "account_mismatch"
   | "error";
 type Failure = Exclude<RenewalResult, "not_needed" | "renewed">;
 export const HOST_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const UTC_RE = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d{1,3})?Z$/;
 const TARGET_RE = /^[A-Za-z0-9._-]+@[A-Za-z0-9.-]+$/;
-const DIR_RE = /^\/[A-Za-z0-9._/-]+$/;
+// Non-empty segments only: a trailing '/' or '/.' would make the writer's test -L follow a symlink.
+const DIR_RE = /^(\/[A-Za-z0-9._-]+)+$/;
 const CONTAINER_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
 const MANUAL_RE = /^[\x20-\x7e]{1,160}$/;
 const LOOPBACK = new Set(["127.0.0.1", "[::1]", "::1", "localhost"]);
@@ -57,13 +59,16 @@ export interface Config {
 export interface Flags {
   force: boolean;
   check: boolean;
+  // Install even if the browser's Xiaomi account differs from the installed session's.
+  rebind: boolean;
 }
 export function parseArgs(argv: readonly string[]): Flags {
-  const flags = { force: false, check: false };
+  const flags = { force: false, check: false, rebind: false };
   for (const arg of argv) {
     if (arg === "--force") flags.force = true;
     else if (arg === "--check") flags.check = true;
-    else throw new ConfigError("usage: refresh-session.ts [--check] [--force]");
+    else if (arg === "--rebind") flags.rebind = true;
+    else throw new ConfigError("usage: refresh-session.ts [--check] [--force] [--rebind]");
   }
   return flags;
 }
@@ -72,7 +77,7 @@ export function validSshTarget(v: string): boolean {
   return TARGET_RE.test(v) && !v.startsWith("-") && !v.includes("@-");
 }
 export const validRemoteDir = (v: string): boolean =>
-  DIR_RE.test(v) && !v.split("/").includes("..");
+  DIR_RE.test(v) && !v.split("/").some((s) => s === "." || s === "..");
 export const validContainer = (v: string): boolean => CONTAINER_RE.test(v);
 export function parseConfig(
   env: Record<string, string | undefined>,
@@ -102,7 +107,7 @@ export function parseConfig(
   const remoteDir = env.XQ_REMOTE_DIR ?? "";
   if (!validRemoteDir(remoteDir))
     throw new ConfigError(
-      "XQ_REMOTE_DIR must be an absolute path of [A-Za-z0-9._/-] without '..'",
+      "XQ_REMOTE_DIR must be an absolute path of [A-Za-z0-9._-] segments, no '.', '..', '//' or trailing '/'",
     );
   const container = env.XQ_COLLECTOR_CONTAINER ?? "";
   if (!validContainer(container))
@@ -170,22 +175,56 @@ export function statusCommand(container: string): string {
     .map(shellQuote)
     .join(" ");
 }
-// stdin: push = cookie line + status JSON; status = status JSON only.
-// Exit 3 missing dir, 4 foreign owner, 5 group/world access, 6/7 bad input.
+// stdin: push/rebind = cookie line + status JSON; status = status JSON only.
+// LC_ALL=C makes lengths byte counts and [!\ -~] exactly "outside printable ASCII".
+// push installs only over a session naming the same userId (rebind skips that check);
+// values stay in shell variables and builtins, never argv or output.
+// Exit 3 bad/missing dir, 4 foreign owner, 5 group/world access, 6/7 bad input,
+// 8 installed session missing, unparseable or of another account.
 export const WRITE_SH = `set -eu
+LC_ALL=C
 umask 077
 d=$1 m=$2 t1= t2=
 trap 'rm -f -- \${t1:+"$t1"} \${t2:+"$t2"}' EXIT
-case $m in push|status) ;; *) exit 2 ;; esac
+case $m in push|rebind|status) ;; *) exit 2 ;; esac
+case $d in /*) ;; *) exit 3 ;; esac
+case $d/ in *//*|*/./*|*/../*) exit 3 ;; esac
 [ -d "$d" ] && [ ! -L "$d" ] || exit 3
 [ "$(stat -c %u -- "$d")" = "$(id -u)" ] || exit 4
 case $(stat -c %a -- "$d") in *00) ;; *) exit 5 ;; esac
-if [ "$m" = push ]; then
+uid() {
+  local IFS=';' p k=0
+  u=
+  set -f
+  for p in $1; do
+    p=\${p#"\${p%%[![:space:]]*}"}
+    p=\${p%"\${p##*[![:space:]]}"}
+    case $p in userId=?*) k=$((k + 1)) u=\${p#userId=} ;; esac
+  done
+  set +f
+  [ "$k" = 1 ]
+}
+if [ "$m" != status ]; then
   IFS= read -r c || exit 6
   [ -n "$c" ] && [ "\${#c}" -le 16384 ] || exit 6
+  case $c in *[!\\ -~]*) exit 6 ;; esac
+  uid "$c" || exit 6
+  if [ "$m" = push ]; then
+    n=$u f=$d/mimo_session
+    [ -f "$f" ] && [ ! -L "$f" ] || exit 8
+    o=$(head -c 16386 -- "$f"; echo .)
+    [ "\${#o}" = "$(($(stat -c %s -- "$f") + 1))" ] || exit 8
+    o=\${o%.}
+    o=\${o#"\${o%%[![:space:]]*}"}
+    o=\${o%"\${o##*[![:space:]]}"}
+    [ -n "$o" ] && [ "\${#o}" -le 16384 ] || exit 8
+    case $o in *[!\\ -~]*) exit 8 ;; esac
+    uid "$o" && [ "$u" = "$n" ] || exit 8
+    o= n=
+  fi
   t1=$(mktemp "$d/.mimo_session.XXXXXXXX")
   printf '%s\\n' "$c" > "$t1"
-  c=
+  c= u=
 fi
 t2=$(mktemp "$d/.renewal-status.XXXXXXXX")
 head -c 4097 > "$t2"
@@ -196,7 +235,7 @@ if [ -n "$t1" ]; then mv -fT -- "$t1" "$d/mimo_session"; t1=; fi
 mv -fT -- "$t2" "$d/renewal-status.json"
 t2=
 `;
-export function writeCommand(dir: string, mode: "push" | "status"): string {
+export function writeCommand(dir: string, mode: "push" | "rebind" | "status"): string {
   if (!validRemoteDir(dir)) throw new ConfigError("invalid remote directory");
   return ["bash", "-c", WRITE_SH, "xiaomi-session-write", dir, mode]
     .map(shellQuote)
@@ -209,6 +248,7 @@ export type SshRunner = (
   timeoutMs: number,
 ) => Promise<{ code: number; stdout: string }>;
 const SSH_ENV = ["PATH", "HOME", "USER", "LOGNAME", "LANG", "SSH_AUTH_SOCK"];
+const MAX_STDOUT = 65536;
 export function spawnRunner(
   options: { binary?: string; env?: Record<string, string | undefined> } = {},
 ): SshRunner {
@@ -231,11 +271,34 @@ export function spawnRunner(
       } catch {
         // Early exit closes the pipe; the exit code reports the failure.
       }
-      const [stdout, code] = await Promise.all([
-        new Response(proc.stdout).text(),
-        proc.exited,
-      ]);
-      return stdout.length > 65536 ? { code: 1, stdout: "" } : { code, stdout };
+      // Counted while reading: a hostile remote must not grow laptop memory.
+      const chunks: Uint8Array[] = [];
+      let total = 0,
+        over = false;
+      const read = async () => {
+        const reader = proc.stdout.getReader();
+        try {
+          while (true) {
+            const { value, done } = await reader.read();
+            if (done) return;
+            total += value.byteLength;
+            if (total > MAX_STDOUT) {
+              over = true;
+              proc.kill("SIGKILL");
+              await reader.cancel().catch(() => undefined);
+              return;
+            }
+            chunks.push(value);
+          }
+        } catch {
+          over = true;
+          proc.kill("SIGKILL");
+        }
+      };
+      const [, code] = await Promise.all([read(), proc.exited]);
+      return over
+        ? { code: 1, stdout: "" }
+        : { code, stdout: new TextDecoder().decode(Buffer.concat(chunks)) };
     } finally {
       clearTimeout(timer);
     }
@@ -281,7 +344,9 @@ export async function connectBrowser(
   origin: string,
   options: ConnectOptions = {},
 ): Promise<CdpClient> {
-  const timeoutMs = options.timeoutMs ?? 3000;
+  // One budget for discovery and socket open together.
+  const timeoutMs = options.timeoutMs ?? 3000,
+    end = Date.now() + timeoutMs;
   let path: string;
   try {
     const response = await (options.fetch ?? fetch)(origin + "/json/version", {
@@ -331,10 +396,13 @@ export async function connectBrowser(
     markClosed!: () => void;
   const closed = new Promise<void>((resolve) => (markClosed = resolve));
   await new Promise<void>((resolve, reject) => {
-    const timer = setTimeout(() => {
-      socket.close();
-      reject(new BrowserUnavailable());
-    }, timeoutMs);
+    const timer = setTimeout(
+      () => {
+        socket.close();
+        reject(new BrowserUnavailable());
+      },
+      Math.max(1, end - Date.now()),
+    );
     socket.addEventListener("open", () => {
       clearTimeout(timer);
       resolve();
@@ -419,17 +487,49 @@ export async function connectBrowser(
 export interface Timeouts {
   statusSshMs: number;
   writeSshMs: number;
+  connectMs: number;
+  commandMs: number;
   navigationMs: number;
   signinGraceMs: number;
+  pollMs: number;
   vendorMs: number;
+  // Budget for every step up to and including the install. After it only the owned-tab
+  // close (closeMs) and one final status write (writeSshMs) may run.
+  runMs: number;
+  closeMs: number;
 }
 export const DEFAULT_TIMEOUTS: Timeouts = {
   statusSshMs: 25000,
   writeSshMs: 20000,
+  connectMs: 3000,
+  commandMs: 10000,
   navigationMs: 45000,
   signinGraceMs: 8000,
+  pollMs: 250,
   vendorMs: 10000,
+  runMs: 100000,
+  closeMs: 2000,
 };
+const DEADLINE = "run deadline exceeded";
+const INTERRUPTED = "interrupted";
+export interface RunContext {
+  // Timeout for the next step: its own cap, never past the run deadline.
+  budget(capMs: number): number;
+  // True within 20 ms of the deadline, so a step cut by budget() always counts as expired.
+  expired(): boolean;
+  // Aborted on SIGTERM/SIGINT.
+  signal?: AbortSignal;
+}
+export function runContext(runMs: number, signal?: AbortSignal): RunContext {
+  const end = performance.now() + runMs;
+  return {
+    budget: (capMs) => Math.max(1, Math.min(capMs, end - performance.now())),
+    expired: () => performance.now() >= end - 20,
+    signal,
+  };
+}
+const stopped = (run: RunContext): string | null =>
+  run.signal?.aborted ? INTERRUPTED : run.expired() ? DEADLINE : null;
 type Outcome = { header: string } | { result: Failure; reason: string };
 const signinHost = (h: string) =>
   h === "account.xiaomi.com" || h.endsWith(".account.xiaomi.com");
@@ -461,30 +561,47 @@ export function selectCookies(cookies: unknown): Outcome {
     parts.push(name + "=" + value);
   }
   const header = parts.join("; ");
-  if (header.length > 16384 || /[\x00-\x1f\x7f]/.test(header))
+  // The collector accepts only 1-16384 printable ASCII characters.
+  if (!/^[\x20-\x7e]{1,16384}$/.test(header))
     return { result: "error", reason: "malformed Xiaomi session cookie" };
   return { header };
 }
 
+// Evaluated in the owned tab; yields only a boolean, never page data.
+export const READY_JS =
+  "(()=>{try{return performance.getEntriesByType('resource').some(e=>{try{const u=new URL(e.name);" +
+  "return u.origin+u.pathname===" +
+  JSON.stringify(USAGE_URL) +
+  "&&e.responseStatus===200}catch{return false}})===true}catch{return false}})()";
 type Wait = "loaded" | "timeout" | "signin" | "nav_failed" | "detached" | "closed";
+// The Network domain stays disabled: its event stream would carry every request's
+// Cookie headers, including account-host passToken during the SSO hop. Readiness comes
+// from main-frame Page.frameNavigated (sign-in grace) and a boolean poll of the tab's
+// resource timing for the usage API (responseStatus 200, same origin).
 function waitForConsole(
   client: CdpClient,
   targetId: string,
   sessionId: string,
   t: Timeouts,
+  run: RunContext,
 ): Promise<Wait> {
   return new Promise((resolve) => {
     let grace: ReturnType<typeof setTimeout> | undefined,
+      poll: ReturnType<typeof setTimeout> | undefined,
       settled = false;
     const done = (v: Wait) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       clearTimeout(grace);
+      clearTimeout(poll);
       off();
+      run.signal?.removeEventListener("abort", interrupt);
       resolve(v);
     };
-    const timer = setTimeout(() => done("timeout"), t.navigationMs);
+    // Interrupt or deadline end the wait like a timeout; the caller then stops.
+    const interrupt = () => done("timeout");
+    const timer = setTimeout(interrupt, run.budget(t.navigationMs));
     const off = client.onEvent(({ method, params, sessionId: sid }) => {
       if (
         (method === "Target.detachedFromTarget" && params.sessionId === sessionId) ||
@@ -493,27 +610,53 @@ function waitForConsole(
         (method === "Inspector.targetCrashed" && sid === sessionId)
       )
         return done("detached");
-      if (sid !== sessionId || method !== "Network.responseReceived") return;
-      const response = params.response;
-      if (!record(response) || typeof response.url !== "string") return;
-      let url: URL;
+      if (sid !== sessionId || method !== "Page.frameNavigated") return;
+      // Main frame only: its id is the target id and it has no parent.
+      const frame = params.frame;
+      if (
+        !record(frame) ||
+        frame.id !== targetId ||
+        frame.parentId !== undefined ||
+        typeof frame.url !== "string"
+      )
+        return;
+      let host: string;
       try {
-        url = new URL(response.url);
+        host = new URL(frame.url).hostname;
       } catch {
         return;
       }
-      if (url.origin + url.pathname === USAGE_URL && response.status === 200)
-        return done("loaded");
-      if (params.type !== "Document" || params.frameId !== targetId) return;
       // SSO pass-through may briefly commit on the account host; a login page stays.
-      if (signinHost(url.hostname))
-        grace ??= setTimeout(() => done("signin"), t.signinGraceMs);
+      if (signinHost(host)) grace ??= setTimeout(() => done("signin"), t.signinGraceMs);
       else {
         clearTimeout(grace);
         grace = undefined;
       }
     });
+    run.signal?.addEventListener("abort", interrupt);
+    if (run.signal?.aborted) return interrupt();
     void client.closed.then(() => done("closed"));
+    const tick = async () => {
+      try {
+        const r = await client.send(
+          "Runtime.evaluate",
+          { expression: READY_JS, returnByValue: true },
+          sessionId,
+          run.budget(t.commandMs),
+        );
+        if (
+          record(r.result) &&
+          r.result.type === "boolean" &&
+          r.result.value === true &&
+          r.exceptionDetails === undefined
+        )
+          return done("loaded");
+      } catch (error) {
+        if (error instanceof BrowserUnavailable) return done("closed");
+        // A navigation can destroy the context mid-call; keep polling.
+      }
+      if (!settled) poll = setTimeout(tick, t.pollMs);
+    };
     client
       .send("Page.navigate", { url: CONSOLE_URL }, sessionId, t.navigationMs + 5000)
       .then(
@@ -528,31 +671,52 @@ function waitForConsole(
         },
         (e) => done(e instanceof BrowserUnavailable ? "closed" : "detached"),
       );
+    poll = setTimeout(tick, t.pollMs);
   });
 }
 export async function readBrowserSession(
   client: CdpClient,
   t: Timeouts,
+  run: RunContext,
 ): Promise<Outcome> {
-  let targetId: string | null = null;
+  let targetId: string | null = null,
+    closing: Promise<unknown> | undefined;
+  // Once, bounded by closeMs: immediately on interrupt, otherwise in finally.
+  const closeOwned = () =>
+    targetId === null
+      ? undefined
+      : (closing ??= client
+          .send("Target.closeTarget", { targetId }, undefined, t.closeMs)
+          .catch(() => undefined));
+  const onInterrupt = () => void closeOwned();
+  run.signal?.addEventListener("abort", onInterrupt);
+  // Timeout for the next command; none once interrupted or past the deadline.
+  const ms = () => {
+    if (stopped(run)) throw new CdpError();
+    return run.budget(t.commandMs);
+  };
   try {
     // Task-owned target only: never list, activate or navigate other targets.
-    const created = await client.send("Target.createTarget", {
-      url: "about:blank",
-      background: true,
-    });
+    const created = await client.send(
+      "Target.createTarget",
+      { url: "about:blank", background: true },
+      undefined,
+      ms(),
+    );
     if (typeof created.targetId !== "string" || !created.targetId)
       throw new CdpError();
     targetId = created.targetId;
-    const attached = await client.send("Target.attachToTarget", {
-      targetId,
-      flatten: true,
-    });
+    const attached = await client.send(
+      "Target.attachToTarget",
+      { targetId, flatten: true },
+      undefined,
+      ms(),
+    );
     if (typeof attached.sessionId !== "string" || !attached.sessionId)
       throw new CdpError();
     const sessionId = attached.sessionId;
-    await client.send("Network.enable", {}, sessionId);
-    const wait = await waitForConsole(client, targetId, sessionId, t);
+    await client.send("Page.enable", {}, sessionId, ms());
+    const wait = await waitForConsole(client, targetId, sessionId, t, run);
     if (wait === "signin")
       return {
         result: "signin_required",
@@ -562,20 +726,24 @@ export async function readBrowserSession(
       return { result: "vendor_unavailable", reason: "Xiaomi console unreachable" };
     if (wait === "closed") throw new BrowserUnavailable();
     if (wait === "detached") throw new CdpError();
-    // Scoped to the platform URL so account.xiaomi.com cookies never leave the browser.
+    // A command, not the event stream: works without Network.enable. Scoped to the
+    // platform URL so account.xiaomi.com cookies never leave the browser.
     const got = await client.send(
       "Network.getCookies",
       { urls: [USAGE_URL] },
       sessionId,
+      ms(),
     );
     return selectCookies(got.cookies);
   } catch (error) {
+    const stop = stopped(run);
+    if (stop) return { result: "error", reason: stop };
     return error instanceof BrowserUnavailable
       ? { result: "browser_unavailable", reason: "browser connection lost" }
       : { result: "error", reason: "browser automation failed" };
   } finally {
-    if (targetId !== null)
-      await client.send("Target.closeTarget", { targetId }).catch(() => undefined);
+    run.signal?.removeEventListener("abort", onInterrupt);
+    await closeOwned();
   }
 }
 
@@ -697,44 +865,58 @@ export function statusJson(
 
 export interface Deps {
   ssh: SshRunner;
-  connectBrowser: (origin: string) => Promise<CdpClient>;
+  connectBrowser: (origin: string, timeoutMs: number) => Promise<CdpClient>;
   fetch: Fetcher;
   now: () => Date;
+  // Aborted on SIGTERM/SIGINT: close the owned tab, write nothing more.
+  signal?: AbortSignal;
 }
 export interface RunOutcome {
-  code: 0 | 1 | 2;
+  code: 0 | 1 | 2 | 3;
   line: string;
 }
 const REMOTE_EXIT: Record<number, string> = {
   3: "remote session directory missing",
   4: "remote session directory not owned by ssh user",
   5: "remote session directory is group/world accessible",
+  8: "installed session belongs to another account",
   255: "ssh failed",
 };
-const exitCode = (r: RenewalResult): 0 | 1 | 2 =>
-  r === "not_needed" || r === "renewed" ? 0 : r === "signin_required" ? 2 : 1;
+const exitCode = (r: RenewalResult): 0 | 1 | 2 | 3 =>
+  r === "not_needed" || r === "renewed"
+    ? 0
+    : r === "signin_required"
+      ? 2
+      : r === "account_mismatch"
+        ? 3
+        : 1;
 export async function runRefresh(
   cfg: Config,
   flags: Flags,
   deps: Deps,
   t: Timeouts = DEFAULT_TIMEOUTS,
 ): Promise<RunOutcome> {
+  const run = runContext(t.runMs, deps.signal);
+  const interrupted = (): RunOutcome => ({ code: 1, line: PREFIX + INTERRUPTED });
+  if (deps.signal?.aborted) return interrupted();
   let status: CollectorStatus | null = null;
   try {
     const r = await deps.ssh(
       sshArgv(cfg.sshTarget, statusCommand(cfg.container)),
       null,
-      t.statusSshMs,
+      run.budget(t.statusSshMs),
     );
     if (r.code === 0) status = parseCollectorStatus(r.stdout);
   } catch {
     status = null;
   }
+  if (deps.signal?.aborted) return interrupted();
   if (!status) return { code: 1, line: PREFIX + "collector_unreachable" };
   const s = status;
   const needed = flags.force || s.error === "auth_required";
   const context =
     (flags.force ? "forced; " : "") +
+    (flags.rebind ? "rebind; " : "") +
     (s.error === null
       ? "collector ok"
       : "collector " + s.error + (s.rejectedAt && s.error === "auth_required" ? " since " + s.rejectedAt : ""));
@@ -748,14 +930,15 @@ export async function runRefresh(
     renewedAt: string | null,
     now: Date,
     cookieHeader: string | null = null,
+    timeoutMs = t.writeSshMs,
   ): Promise<number> {
     const json = statusJson(cfg, result, now, renewedAt);
     try {
-      const mode = cookieHeader === null ? "status" : "push";
+      const mode = cookieHeader === null ? "status" : flags.rebind ? "rebind" : "push";
       const r = await deps.ssh(
         sshArgv(cfg.sshTarget, writeCommand(cfg.remoteDir, mode)),
         (cookieHeader === null ? "" : cookieHeader + "\n") + json + "\n",
-        t.writeSshMs,
+        timeoutMs,
       );
       return r.code;
     } catch {
@@ -763,7 +946,9 @@ export async function runRefresh(
     }
   }
   const why = (code: number) => REMOTE_EXIT[code] ?? "remote exit " + code;
+  // The one status write allowed after the deadline (bounded by writeSshMs).
   async function fail(result: Failure, reason: string): Promise<RunOutcome> {
+    if (deps.signal?.aborted) return interrupted();
     // Best effort: the collector page shows this; the exit code still reports it.
     const code = await write(result, s.renewedAt, deps.now());
     return {
@@ -784,26 +969,33 @@ export async function runRefresh(
             line: PREFIX + "not_needed (" + context + "); status write failed: " + why(code),
           };
     }
+    if (run.expired()) return fail("error", DEADLINE);
     let client: CdpClient;
     try {
-      client = await deps.connectBrowser(cfg.cdpOrigin);
+      client = await deps.connectBrowser(cfg.cdpOrigin, run.budget(t.connectMs));
     } catch {
-      return fail("browser_unavailable", "DevTools endpoint unreachable");
+      const stop = stopped(run);
+      return stop ? fail("error", stop) : fail("browser_unavailable", "DevTools endpoint unreachable");
     }
     let outcome: Outcome;
     try {
-      outcome = await readBrowserSession(client, t);
+      outcome = await readBrowserSession(client, t, run);
     } finally {
       client.close();
     }
     if ("result" in outcome) return fail(outcome.result, outcome.reason);
-    const valid = await validateSession(outcome.header, deps.fetch, t.vendorMs);
+    if (run.expired()) return fail("error", DEADLINE);
+    const valid = await validateSession(outcome.header, deps.fetch, run.budget(t.vendorMs));
+    const stop = stopped(run);
+    if (stop) return fail("error", stop);
     if (valid === "signin_required")
       return fail("signin_required", "Xiaomi rejected the browser session");
     if (valid === "vendor_unavailable")
       return fail("vendor_unavailable", "Xiaomi validation failed");
     const now = deps.now();
-    const code = await write("renewed", now.toISOString(), now, outcome.header);
+    const code = await write("renewed", now.toISOString(), now, outcome.header, run.budget(t.writeSshMs));
+    if (code === 8)
+      return fail("account_mismatch", "browser account does not match the installed session");
     if (code !== 0) return fail("error", "session push failed: " + why(code));
     return { code: 0, line: PREFIX + "renewed (" + context + ")" };
   } catch {

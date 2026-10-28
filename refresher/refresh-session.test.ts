@@ -38,9 +38,14 @@ const PREVIOUS = "2030-01-01T01:00:00.000Z";
 const T: lib.Timeouts = {
   statusSshMs: 1000,
   writeSshMs: 1000,
+  connectMs: 1000,
+  commandMs: 1000,
   navigationMs: 200,
   signinGraceMs: 50,
+  pollMs: 5,
   vendorMs: 1000,
+  runMs: 5000,
+  closeMs: 500,
 };
 const CONSOLE_DOC = "https://platform.xiaomimimo.com/";
 
@@ -70,6 +75,7 @@ function expectContractB(json: string) {
     "signin_required",
     "browser_unavailable",
     "vendor_unavailable",
+    "account_mismatch",
     "error",
   ]).toContain(v.result);
   expect(v.renewedAt === null || utc(v.renewedAt)).toBe(true);
@@ -111,42 +117,64 @@ const collector = (error: string | null, extra: Record<string, unknown> = {}) =>
 interface SshCall {
   argv: string[];
   stdin: string | null;
-  kind: "read" | "push" | "status";
+  kind: "read" | "push" | "rebind" | "status";
+  timeoutMs: number;
 }
+const kindOf = (command: string): SshCall["kind"] =>
+  command.startsWith("'sudo'")
+    ? "read"
+    : command.endsWith("'push'")
+      ? "push"
+      : command.endsWith("'rebind'")
+        ? "rebind"
+        : "status";
 function fakeSsh(
   o: { stdout?: string; read?: number; write?: number; push?: number; throws?: boolean } = {},
 ) {
   const calls: SshCall[] = [];
-  const run: lib.SshRunner = async (argv, stdin) => {
-    const command = argv[argv.length - 1];
-    const kind = command.startsWith("'sudo'")
-      ? "read"
-      : command.endsWith("'push'")
-        ? "push"
-        : "status";
-    calls.push({ argv: [...argv], stdin, kind });
+  const run: lib.SshRunner = async (argv, stdin, timeoutMs) => {
+    const kind = kindOf(argv[argv.length - 1]);
+    calls.push({ argv: [...argv], stdin, kind, timeoutMs });
     if (o.throws) throw new Error("synthetic spawn failure");
     if (kind === "read")
       return { code: o.read ?? 0, stdout: o.stdout ?? collector("auth_required") };
-    return { code: (kind === "push" ? o.push : o.write) ?? 0, stdout: "" };
+    return { code: (kind === "status" ? o.write : o.push) ?? 0, stdout: "" };
+  };
+  return { run, calls };
+}
+// Status read is faked; writes run the real WRITE_SH locally against a temp directory.
+function writerSsh(stdout = collector("auth_required")) {
+  const calls: SshCall[] = [];
+  const local = lib.spawnRunner({ env: { PATH: process.env.PATH, HOME: tmpdir() } });
+  const run: lib.SshRunner = async (argv, stdin, timeoutMs) => {
+    const kind = kindOf(argv[argv.length - 1]);
+    calls.push({ argv: [...argv], stdin, kind, timeoutMs });
+    if (kind === "read") return { code: 0, stdout };
+    return local(["sh", "-c", argv[argv.length - 1]], stdin, 5000);
   };
   return { run, calls };
 }
 
 type Emit = (e: lib.CdpEvent) => void;
-const doc = (url: string, frameId = "T-OWNED", sessionId = "S-OWNED"): lib.CdpEvent => ({
+const nav = (
+  url: string,
+  frameId = "T-OWNED",
+  sessionId = "S-OWNED",
+  parentId?: string,
+): lib.CdpEvent => ({
+  method: "Page.frameNavigated",
+  sessionId,
+  params: { frame: { id: frameId, ...(parentId ? { parentId } : {}), loaderId: "L-1", url }, type: "Navigation" },
+});
+// Legacy Network-domain readiness signal; the refresher must ignore it.
+const usageEvent = (sessionId = "S-OWNED"): lib.CdpEvent => ({
   method: "Network.responseReceived",
   sessionId,
-  params: { type: "Document", frameId, response: { url, status: 200 } },
+  params: { type: "XHR", frameId: "T-OWNED", response: { url: lib.USAGE_URL, status: 200 } },
 });
-const usage = (status = 200, sessionId = "S-OWNED"): lib.CdpEvent => ({
-  method: "Network.responseReceived",
-  sessionId,
-  params: { type: "XHR", frameId: "T-OWNED", response: { url: lib.USAGE_URL, status } },
-});
-const loads = (emit: Emit) => {
-  emit(doc(CONSOLE_DOC));
-  emit(usage());
+const loads = (emit: Emit, cdp: FakeCdp) => {
+  emit(nav(CONSOLE_DOC));
+  cdp.ready = true;
 };
 const jar = (over: Record<string, unknown>[] = []) => [
   { name: "passToken", value: PASS_TOKEN, domain: ".account.xiaomi.com", path: "/" },
@@ -163,10 +191,16 @@ interface Script {
   navigate?: Record<string, unknown>;
   cookies?: unknown;
   failOn?: string;
+  // Simulates an unanswered command: rejects like the real client once its timeout passes.
+  hang?: string;
+  evaluate?: Record<string, unknown>;
+  evaluateErrors?: number;
 }
 class FakeCdp implements lib.CdpClient {
   sent: { method: string; params: Record<string, unknown>; sessionId?: string }[] = [];
+  timing: { method: string; ms?: number; at: number }[] = [];
   socketClosed = false;
+  ready = false;
   private listeners = new Set<(e: lib.CdpEvent) => void>();
   private markClosed!: () => void;
   readonly closed = new Promise<void>((resolve) => (this.markClosed = resolve));
@@ -177,20 +211,31 @@ class FakeCdp implements lib.CdpClient {
   drop() {
     this.markClosed();
   }
-  async send(method: string, params: Record<string, unknown> = {}, sessionId?: string) {
+  async send(method: string, params: Record<string, unknown> = {}, sessionId?: string, ms?: number) {
     this.sent.push({ method, params, sessionId });
+    this.timing.push({ method, ms, at: Date.now() });
     if (this.script.failOn === method) throw new Error("synthetic cdp failure");
+    if (this.script.hang === method) {
+      await Bun.sleep(ms ?? 60000);
+      throw new lib.CdpError();
+    }
     switch (method) {
       case "Target.createTarget":
         return { targetId: "T-OWNED" };
       case "Target.attachToTarget":
         return { sessionId: "S-OWNED" };
-      case "Network.enable":
+      case "Page.enable":
       case "Target.closeTarget":
         return {};
       case "Page.navigate":
         setTimeout(() => (this.script.onNavigate ?? loads)(this.emit, this), 1);
         return this.script.navigate ?? { frameId: "T-OWNED", loaderId: "L-1" };
+      case "Runtime.evaluate":
+        if ((this.script.evaluateErrors ?? 0) > 0) {
+          this.script.evaluateErrors!--;
+          throw new lib.CdpError();
+        }
+        return this.script.evaluate ?? { result: { type: "boolean", value: this.ready } };
       case "Network.getCookies":
         return { cookies: this.script.cookies ?? jar() };
     }
@@ -206,11 +251,13 @@ class FakeCdp implements lib.CdpClient {
 }
 // The run may only touch the target it created, and must always close it.
 function expectOwnedOnly(cdp: FakeCdp) {
+  // No Network.enable: the network event stream would carry account-host cookie headers.
   const allowed = [
     "Target.createTarget",
     "Target.attachToTarget",
-    "Network.enable",
+    "Page.enable",
     "Page.navigate",
+    "Runtime.evaluate",
     "Network.getCookies",
     "Target.closeTarget",
   ];
@@ -226,6 +273,8 @@ function expectOwnedOnly(cdp: FakeCdp) {
     else expect(s.sessionId).toBe("S-OWNED");
     if (s.method === "Page.navigate") expect(s.params).toEqual({ url: lib.CONSOLE_URL });
     if (s.method === "Network.getCookies") expect(s.params).toEqual({ urls: [lib.USAGE_URL] });
+    if (s.method === "Runtime.evaluate")
+      expect(s.params).toEqual({ expression: lib.READY_JS, returnByValue: true });
   }
   expect(cdp.sent.filter((s) => s.method === "Target.closeTarget")).toEqual([
     { method: "Target.closeTarget", params: { targetId: "T-OWNED" }, sessionId: undefined },
@@ -252,27 +301,34 @@ async function run(
     ssh?: ReturnType<typeof fakeSsh>;
     cdp?: FakeCdp | "down";
     fetch?: ReturnType<typeof fakeFetch>;
+    cfg?: lib.Config;
+    t?: lib.Timeouts;
+    signal?: AbortSignal;
   } = {},
 ) {
   const ssh = o.ssh ?? fakeSsh();
   const cdp = o.cdp ?? new FakeCdp();
   const fetcher = o.fetch ?? fakeFetch();
+  const t = o.t ?? T;
   let connects = 0;
   const out = await lib.runRefresh(
-    cfg,
-    { force: false, check: false, ...o.flags },
+    o.cfg ?? cfg,
+    { force: false, check: false, rebind: false, ...o.flags },
     {
       ssh: ssh.run,
-      connectBrowser: async (origin) => {
+      connectBrowser: async (origin, ms) => {
         connects++;
         expect(origin).toBe("http://127.0.0.1:9223");
+        expect(ms).toBeGreaterThan(0);
+        expect(ms).toBeLessThanOrEqual(t.connectMs);
         if (cdp === "down") throw new lib.BrowserUnavailable();
         return cdp;
       },
       fetch: fetcher.f,
       now: () => NOW,
+      signal: o.signal,
     },
-    T,
+    t,
   );
   expectNoLeak(out.line, ...ssh.calls.flatMap((c) => c.argv));
   for (const call of ssh.calls) {
@@ -290,7 +346,7 @@ async function run(
       "-o",
       "ClearAllForwardings=yes",
     ]);
-    if (call.kind !== "push") expectNoLeak(call.stdin);
+    if (call.kind === "read" || call.kind === "status") expectNoLeak(call.stdin);
   }
   const statusWrites = ssh.calls.filter((c) => c.kind !== "read");
   const written = statusWrites.map((c) => {
@@ -363,6 +419,12 @@ test("config: rejects non-loopback CDP and injection attempts without echoing th
       "/srv/a b",
       "/srv/x\n",
       "~/session",
+      "/srv/x/",
+      "/srv/x/.",
+      "/srv/./x",
+      "/srv//x",
+      "/",
+      "//",
     ],
     XQ_COLLECTOR_CONTAINER: ["", "-x", ".x", "x;id", "x y", "$(id)", "x'y", "x".repeat(129)],
     XQ_MANUAL_COMMAND: ["tab\there", "café", "x".repeat(161), "line\nbreak"],
@@ -385,11 +447,12 @@ test("config: rejects non-loopback CDP and injection attempts without echoing th
     "/a/.hidden/b..c",
   );
 });
-test("flags: --check and --force only", () => {
-  expect(lib.parseArgs([])).toEqual({ force: false, check: false });
-  expect(lib.parseArgs(["--check", "--force"])).toEqual({ force: true, check: true });
-  for (const arg of ["--help", "-f", "force", "--check=1"])
-    expect(() => lib.parseArgs([arg])).toThrow(/usage/);
+test("flags: --check, --force and --rebind only", () => {
+  expect(lib.parseArgs([])).toEqual({ force: false, check: false, rebind: false });
+  expect(lib.parseArgs(["--check", "--force"])).toEqual({ force: true, check: true, rebind: false });
+  expect(lib.parseArgs(["--rebind"])).toEqual({ force: false, check: false, rebind: true });
+  for (const arg of ["--help", "-f", "force", "--check=1", "--rebind=1", "--re-bind"])
+    expect(() => lib.parseArgs([arg])).toThrow(/usage: refresh-session.ts \[--check\] \[--force\] \[--rebind\]/);
 });
 
 async function sh(command: string, stdin: string | null = null, path = process.env.PATH!) {
@@ -419,8 +482,9 @@ test("remote commands: single-quoted words survive a POSIX login shell exactly",
   }
   for (const name of ["x;id", "-x", "$(id)", "a b"])
     expect(() => lib.statusCommand(name)).toThrow(lib.ConfigError);
-  for (const dir of ["/a/../b", "/x;id", "rel"])
-    expect(() => lib.writeCommand(dir, "push")).toThrow(lib.ConfigError);
+  for (const dir of ["/a/../b", "/x;id", "rel", "/a/b/", "/a/./b", "/a//b", "/a/.", "/"])
+    for (const mode of ["push", "rebind", "status"] as const)
+      expect(() => lib.writeCommand(dir, mode)).toThrow(lib.ConfigError);
   expect(() => lib.sshArgv("-oProxyCommand=x@h", "true")).toThrow(lib.ConfigError);
   expect(lib.sshArgv("tim@collector.example", "true").slice(-3)).toEqual([
     "--",
@@ -440,24 +504,31 @@ async function sessionDir(fn: (dir: string, root: string) => Promise<void>, mode
     await rm(root, { recursive: true, force: true });
   }
 }
-const remote = (dir: string, mode: "push" | "status", stdin: string) =>
+const remote = (dir: string, mode: "push" | "rebind" | "status", stdin: string) =>
   sh(lib.writeCommand(dir, mode), stdin);
+// Bypasses writeCommand's validation to exercise the writer's own path checks.
+const rawRemote = (dir: string, stdin: string) =>
+  sh(["bash", "-c", lib.WRITE_SH, "xiaomi-session-write", dir, "status"].map(lib.shellQuote).join(" "), stdin);
 const modeOf = async (p: string) => (await lstat(p)).mode & 0o777;
 test("remote writer: atomic owner-only replace with stdin framing and no leftovers", async () => {
   await sessionDir(async (dir) => {
     const status = '{"schemaVersion":1}';
-    expect(await remote(dir, "push", HEADER + "\n" + status + "\n")).toEqual({ code: 0, stdout: "" });
+    // First install: no session to compare with, so only rebind installs.
+    expect(await remote(dir, "push", HEADER + "\n" + status + "\n")).toEqual({ code: 8, stdout: "" });
+    expect(await readdir(dir)).toEqual([]);
+    expect(await remote(dir, "rebind", HEADER + "\n" + status + "\n")).toEqual({ code: 0, stdout: "" });
     expect(await readFile(join(dir, "mimo_session"), "utf8")).toBe(HEADER + "\n");
     expect(await readFile(join(dir, "renewal-status.json"), "utf8")).toBe(status + "\n");
     expect(await modeOf(join(dir, "mimo_session"))).toBe(0o600);
     expect(await modeOf(join(dir, "renewal-status.json"))).toBe(0o600);
     const before = (await lstat(join(dir, "mimo_session"))).ino;
-    expect((await remote(dir, "push", "next=SYNTHETIC-2\n" + status + "\n")).code).toBe(0);
+    const next = "next=SYNTHETIC-2; userId=" + SECRETS.userId;
+    expect((await remote(dir, "push", next + "\n" + status + "\n")).code).toBe(0);
     expect((await lstat(join(dir, "mimo_session"))).ino).not.toBe(before);
-    expect(await readFile(join(dir, "mimo_session"), "utf8")).toBe("next=SYNTHETIC-2\n");
+    expect(await readFile(join(dir, "mimo_session"), "utf8")).toBe(next + "\n");
     // Status-only mode leaves the session untouched and treats all stdin as status.
     expect((await remote(dir, "status", '{"heartbeat":1}\n')).code).toBe(0);
-    expect(await readFile(join(dir, "mimo_session"), "utf8")).toBe("next=SYNTHETIC-2\n");
+    expect(await readFile(join(dir, "mimo_session"), "utf8")).toBe(next + "\n");
     expect(await readFile(join(dir, "renewal-status.json"), "utf8")).toBe('{"heartbeat":1}\n');
     expect((await readdir(dir)).sort()).toEqual(["mimo_session", "renewal-status.json"]);
     // Rejected input keeps both previous files and cleans its temp files.
@@ -474,6 +545,10 @@ test("remote writer: refuses missing, symlinked or group/world-accessible direct
     expect((await remote(join(root, "missing"), "status", "{}\n")).code).toBe(3);
     await symlink(dir, join(root, "link"));
     expect((await remote(join(root, "link"), "status", "{}\n")).code).toBe(3);
+    // test -L follows a trailing '/' or '/.'; such spellings are refused outright.
+    for (const spelling of ["link/", "link/.", "link//", "session/", "session/.", "./session"])
+      expect((await rawRemote(root + "/" + spelling, "{}\n")).code).toBe(3);
+    expect((await rawRemote("session", "{}\n")).code).toBe(3);
     expect(await readdir(dir)).toEqual([]);
   });
   for (const mode of [0o750, 0o705, 0o770])
@@ -756,7 +831,7 @@ test("sign-in page: signin_required early, owned target closed, nothing copied",
   const started = Date.now();
   const r = await run({
     cdp: new FakeCdp({
-      onNavigate: (emit) => emit(doc("https://account.xiaomi.com/fe/service/login?sid=synthetic")),
+      onNavigate: (emit) => emit(nav("https://account.xiaomi.com/fe/service/login?sid=synthetic")),
     }),
   });
   expect(r.out.code).toBe(2);
@@ -775,10 +850,10 @@ test("sign-in page: signin_required early, owned target closed, nothing copied",
 test("SSO pass-through via the account host still renews", async () => {
   const r = await run({
     cdp: new FakeCdp({
-      onNavigate: (emit) => {
-        emit(doc("https://account.xiaomi.com/pass/serviceLogin?sid=synthetic"));
-        setTimeout(() => emit(doc(CONSOLE_DOC)), 10);
-        setTimeout(() => emit(usage()), 100);
+      onNavigate: (emit, cdp) => {
+        emit(nav("https://account.xiaomi.com/pass/serviceLogin?sid=synthetic"));
+        setTimeout(() => emit(nav(CONSOLE_DOC)), 10);
+        setTimeout(() => (cdp.ready = true), 100);
       },
     }),
   });
@@ -786,22 +861,45 @@ test("SSO pass-through via the account host still renews", async () => {
   expect(r.out.line).toStartWith("xiaomi-session-refresh: renewed");
   expectOwnedOnly(r.cdp as FakeCdp);
 });
-test("foreign targets and sessions are ignored; timeout still validates cookies", async () => {
+test("foreign targets, subframes and network events are ignored; timeout still validates cookies", async () => {
   const started = Date.now();
   const r = await run({
     cdp: new FakeCdp({
       onNavigate: (emit) => {
-        emit(usage(200, "S-USER"));
-        emit(doc("https://account.xiaomi.com/fe/service/login", "T-USER", "S-USER"));
+        emit(usageEvent());
+        emit(usageEvent("S-USER"));
+        emit(nav("https://account.xiaomi.com/fe/service/login", "T-USER", "S-USER"));
+        emit(nav("https://account.xiaomi.com/fe/service/login", "F-SUB", "S-OWNED", "T-OWNED"));
+        emit({ method: "Page.frameNavigated", sessionId: "S-OWNED", params: { frame: { id: "T-OWNED", url: 7 } } });
+        emit({ method: "Page.frameNavigated", sessionId: "S-OWNED", params: {} });
         emit({ method: "Target.targetDestroyed", params: { targetId: "T-USER" } });
         emit({ method: "Target.detachedFromTarget", params: { sessionId: "S-USER" } });
-        emit(usage(401));
       },
     }),
   });
   expect(Date.now() - started).toBeGreaterThanOrEqual(T.navigationMs - 20);
   expect(r.out.code).toBe(0);
   expectOwnedOnly(r.cdp as FakeCdp);
+  // Readiness polling continued until the console wait expired.
+  expect((r.cdp as FakeCdp).sent.filter((s) => s.method === "Runtime.evaluate").length).toBeGreaterThan(3);
+  // Only a boolean true counts as ready.
+  for (const evaluate of [
+    { result: { type: "string", value: "true" } },
+    { result: { type: "object", value: { ready: true } } },
+    { result: { type: "boolean", value: true }, exceptionDetails: { text: "synthetic" } },
+    {},
+  ]) {
+    const t0 = Date.now();
+    const odd = await run({ cdp: new FakeCdp({ evaluate }) });
+    expect(Date.now() - t0).toBeGreaterThanOrEqual(T.navigationMs - 20);
+    expect(odd.out.code).toBe(0);
+  }
+  // Transient evaluate failures (context destroyed by navigation) keep polling.
+  const t1 = Date.now();
+  const flaky = await run({ cdp: new FakeCdp({ evaluateErrors: 3 }) });
+  expect(flaky.out.code).toBe(0);
+  expect(Date.now() - t1).toBeLessThan(T.navigationMs);
+  expectOwnedOnly(flaky.cdp as FakeCdp);
   // Timeout with stale browser cookies: Xiaomi decides.
   const stale = await run({
     cdp: new FakeCdp({ onNavigate: () => {} }),
@@ -841,7 +939,7 @@ test("every failure branch writes its status and closes the owned target", async
     { name: "validation 403", fetch: fakeFetch({ detail: () => new Response(null, { status: 403 }) }), result: "signin_required", code: 2, reason: "Xiaomi rejected the browser session" },
     { name: "validation 5xx", fetch: fakeFetch({ usage: () => new Response(null, { status: 503 }) }), result: "vendor_unavailable", code: 1, reason: "Xiaomi validation failed" },
     { name: "target destroyed", cdp: new FakeCdp({ onNavigate: (emit) => emit({ method: "Target.targetDestroyed", params: { targetId: "T-OWNED" } }) }), result: "error", code: 1, reason: "browser automation failed" },
-    { name: "enable throws", cdp: new FakeCdp({ failOn: "Network.enable" }), result: "error", code: 1, reason: "browser automation failed" },
+    { name: "enable throws", cdp: new FakeCdp({ failOn: "Page.enable" }), result: "error", code: 1, reason: "browser automation failed" },
     { name: "attach throws", cdp: new FakeCdp({ failOn: "Target.attachToTarget" }), result: "error", code: 1, reason: "browser automation failed" },
     { name: "navigate throws", cdp: new FakeCdp({ failOn: "Page.navigate" }), result: "error", code: 1, reason: "browser automation failed" },
     { name: "cookies throw", cdp: new FakeCdp({ failOn: "Network.getCookies" }), result: "error", code: 1, reason: "browser automation failed" },
@@ -1021,9 +1119,10 @@ test("end to end over a synthetic DevTools socket: renewed, owned target closed"
     if (m.method === "Target.attachToTarget") return reply({ sessionId: "S-OWNED" });
     if (m.method === "Page.navigate") {
       // Events may precede the navigate reply, as in Chrome.
-      for (const e of [doc(CONSOLE_DOC), usage()]) emit(e);
+      emit(nav(CONSOLE_DOC));
       return reply({ frameId: "T-OWNED", loaderId: "L-1" });
     }
+    if (m.method === "Runtime.evaluate") return reply({ result: { type: "boolean", value: true } });
     if (m.method === "Network.getCookies") return reply({ cookies: jar() });
     reply({});
   });
@@ -1032,8 +1131,13 @@ test("end to end over a synthetic DevTools socket: renewed, owned target closed"
     const fetcher = fakeFetch();
     const out = await lib.runRefresh(
       { ...cfg, cdpOrigin: fake.origin },
-      { force: false, check: false },
-      { ssh: ssh.run, connectBrowser: (o) => lib.connectBrowser(o), fetch: fetcher.f, now: () => NOW },
+      { force: false, check: false, rebind: false },
+      {
+        ssh: ssh.run,
+        connectBrowser: (o, ms) => lib.connectBrowser(o, { timeoutMs: ms }),
+        fetch: fetcher.f,
+        now: () => NOW,
+      },
       T,
     );
     expect(out.code).toBe(0);
@@ -1041,11 +1145,16 @@ test("end to end over a synthetic DevTools socket: renewed, owned target closed"
     expect(fake.seen.map((m) => [m.method, m.sessionId ?? null])).toEqual([
       ["Target.createTarget", null],
       ["Target.attachToTarget", null],
-      ["Network.enable", "S-OWNED"],
+      ["Page.enable", "S-OWNED"],
       ["Page.navigate", "S-OWNED"],
+      ["Runtime.evaluate", "S-OWNED"],
       ["Network.getCookies", "S-OWNED"],
       ["Target.closeTarget", null],
     ]);
+    expect(fake.seen.find((m) => m.method === "Runtime.evaluate")!.params).toEqual({
+      expression: lib.READY_JS,
+      returnByValue: true,
+    });
     expect(fake.seen.at(-1)!.params).toEqual({ targetId: "T-OWNED" });
   } finally {
     fake.stop();
@@ -1076,3 +1185,351 @@ test("entrypoint refuses invalid configuration before any I/O", async () => {
     await rm(home, { recursive: true, force: true });
   }
 });
+
+// Account binding: the writer compares userId of the new line with the installed session.
+const OTHER = "api-platform_serviceToken=SYNTHETIC-other-svc; userId=SYNTHETIC-uid-9999";
+const writerSecrets = [...Object.values(SECRETS), "SYNTHETIC-uid-9999", "SYNTHETIC-other-svc"];
+async function writer(dir: string, mode: "push" | "rebind", stdin: string) {
+  // Direct spawn so the writer's own stdout/stderr can be inspected for leaks.
+  const p = Bun.spawn(["sh", "-c", lib.writeCommand(dir, mode)], {
+    stdin: "pipe",
+    stdout: "pipe",
+    stderr: "pipe",
+    env: { PATH: process.env.PATH!, HOME: tmpdir() },
+  });
+  p.stdin.write(stdin);
+  await p.stdin.end();
+  const [code, out, err] = await Promise.all([
+    p.exited,
+    new Response(p.stdout).text(),
+    new Response(p.stderr).text(),
+  ]);
+  for (const secret of writerSecrets) {
+    expect(out).not.toContain(secret);
+    expect(err).not.toContain(secret);
+  }
+  return code;
+}
+test("remote writer: push replaces only a session of the same account; rebind skips the check", async () => {
+  await sessionDir(async (dir) => {
+    const file = join(dir, "mimo_session");
+    const put = async (content: string | Uint8Array) => {
+      await rm(file, { recursive: true, force: true });
+      await writeFile(file, content, { mode: 0o600 });
+    };
+    const status = '{"schemaVersion":1}\n';
+    // Same userId, other cookies and spacing differ: replaced.
+    for (const current of [
+      "api-platform_serviceToken=SYNTHETIC-old; userId=" + SECRETS.userId + "\n",
+      "  userId=" + SECRETS.userId + " ;api-platform_ph=SYNTHETIC-old\r\n",
+      "a=1;userId=" + SECRETS.userId,
+      "userId=" + SECRETS.userId + ";\t",
+    ]) {
+      await put(current);
+      expect(await writer(dir, "push", HEADER + "\n" + status)).toBe(0);
+      expect(await readFile(file, "utf8")).toBe(HEADER + "\n");
+    }
+    // Different, missing, ambiguous or unparseable current account: refused, file untouched.
+    const refused: (string | Uint8Array)[] = [
+      OTHER + "\n",
+      "api-platform_serviceToken=SYNTHETIC-old\n",
+      "userId=\n",
+      "xuserId=" + SECRETS.userId + "\n",
+      "userId=" + SECRETS.userId + "; userId=" + SECRETS.userId + "\n",
+      "userId=" + SECRETS.userId + "x\n",
+      "userId=" + SECRETS.userId + "; note=…\n",
+      new Uint8Array([...Buffer.from("userId=" + SECRETS.userId), 0, 0x41, 0x0a]),
+      "userId=" + SECRETS.userId + "; pad=" + "x".repeat(16400) + "\n",
+      "\n",
+    ];
+    for (const current of refused) {
+      await put(current);
+      const before = await lstat(file);
+      await writeFile(join(dir, "renewal-status.json"), '{"previous":1}\n', { mode: 0o600 });
+      expect(await writer(dir, "push", HEADER + "\n" + status)).toBe(8);
+      const after = await lstat(file);
+      expect([after.ino, after.mtimeMs]).toEqual([before.ino, before.mtimeMs]);
+      expect(Buffer.compare(await readFile(file), Buffer.from(current))).toBe(0);
+      expect(await readFile(join(dir, "renewal-status.json"), "utf8")).toBe('{"previous":1}\n');
+      expect((await readdir(dir)).sort()).toEqual(["mimo_session", "renewal-status.json"]);
+    }
+    // A missing file, a symlink or a non-regular file has no account to compare.
+    await rm(file);
+    expect(await writer(dir, "push", HEADER + "\n" + status)).toBe(8);
+    expect(await readdir(dir)).toEqual(["renewal-status.json"]);
+    const elsewhere = join(dir, "..", "elsewhere");
+    await writeFile(elsewhere, "userId=" + SECRETS.userId + "\n", { mode: 0o600 });
+    await symlink(elsewhere, file);
+    expect(await writer(dir, "push", HEADER + "\n" + status)).toBe(8);
+    expect((await lstat(file)).isSymbolicLink()).toBe(true);
+    await rm(file);
+    // --rebind installs over a different account and over no session at all.
+    expect(await writer(dir, "rebind", HEADER + "\n" + status)).toBe(0);
+    expect(await readFile(file, "utf8")).toBe(HEADER + "\n");
+    await put(OTHER + "\n");
+    expect(await writer(dir, "rebind", HEADER + "\n" + status)).toBe(0);
+    expect(await readFile(file, "utf8")).toBe(HEADER + "\n");
+    // The new line itself must name exactly one account, in both modes.
+    for (const mode of ["push", "rebind"] as const)
+      for (const line of [
+        "api-platform_serviceToken=SYNTHETIC-x",
+        "userId=a; userId=b",
+        "userId=",
+      ]) {
+        await put(HEADER + "\n");
+        expect(await writer(dir, mode, line + "\n" + status)).toBe(6);
+        expect(await readFile(file, "utf8")).toBe(HEADER + "\n");
+      }
+    expect((await readdir(dir)).sort()).toEqual(["mimo_session", "renewal-status.json"]);
+  });
+}, 30000);
+test("remote writer: the new line must be 1-16384 printable ASCII bytes", async () => {
+  await sessionDir(async (dir) => {
+    const file = join(dir, "mimo_session");
+    await writeFile(file, HEADER + "\n", { mode: 0o600 });
+    for (const bad of ["…", "é", "\x01", "\t", "\x7f", "\x80"]) {
+      const line = HEADER.replace("SYNTHETIC-ph-cccc", "SYNTHETIC-ph" + bad);
+      expect(await writer(dir, "rebind", line + "\n{}\n")).toBe(6);
+      expect(await readFile(file, "utf8")).toBe(HEADER + "\n");
+    }
+    const max = "userId=" + SECRETS.userId + "; pad=";
+    const fits = max + "x".repeat(16384 - max.length);
+    expect(await writer(dir, "rebind", fits + "\n{}\n")).toBe(0);
+    expect(await writer(dir, "rebind", fits + "x\n{}\n")).toBe(6);
+    expect(await readFile(file, "utf8")).toBe(fits + "\n");
+  });
+});
+test("account binding end to end: same account renews, other account is account_mismatch, --rebind switches", async () => {
+  await sessionDir(async (dir) => {
+    const c = { ...cfg, remoteDir: dir };
+    const file = join(dir, "mimo_session");
+    const statusFile = async () => JSON.parse(await readFile(join(dir, "renewal-status.json"), "utf8"));
+    await writeFile(file, "api-platform_serviceToken=SYNTHETIC-old; userId=" + SECRETS.userId + "\n", { mode: 0o600 });
+    let r = await run({ cfg: c, ssh: writerSsh() });
+    expect(r.out).toEqual({ code: 0, line: "xiaomi-session-refresh: renewed (collector auth_required since " + REJECTED + ")" });
+    expect(await readFile(file, "utf8")).toBe(HEADER + "\n");
+    expect((await statusFile()).result).toBe("renewed");
+    const mismatch =
+      "xiaomi-session-refresh: account_mismatch (browser account does not match the installed session; collector auth_required since " +
+      REJECTED +
+      ")";
+    for (const current of [OTHER + "\n", "api-platform_serviceToken=SYNTHETIC-other-svc\n", null]) {
+      await rm(file, { force: true });
+      if (current !== null) await writeFile(file, current, { mode: 0o600 });
+      const before = current === null ? null : (await lstat(file)).ino;
+      r = await run({ cfg: c, ssh: writerSsh() });
+      expect(r.out).toEqual({ code: 3, line: mismatch });
+      expect(r.ssh.calls.map((x) => x.kind)).toEqual(["read", "push", "status"]);
+      expect(r.written.map((w) => w.result)).toEqual(["renewed", "account_mismatch"]);
+      expect(r.written[1].renewedAt).toBe(PREVIOUS);
+      expect(await statusFile()).toMatchObject({ result: "account_mismatch", renewedAt: PREVIOUS });
+      if (current === null) expect(await readdir(dir)).toEqual(["renewal-status.json"]);
+      else {
+        expect(await readFile(file, "utf8")).toBe(current);
+        expect((await lstat(file)).ino).toBe(before!);
+      }
+      for (const secret of writerSecrets) expect(r.out.line).not.toContain(secret);
+    }
+    // Operator-chosen rebind: no comparison, the line records it.
+    r = await run({ cfg: c, ssh: writerSsh(), flags: { rebind: true } });
+    expect(r.out).toEqual({
+      code: 0,
+      line: "xiaomi-session-refresh: renewed (rebind; collector auth_required since " + REJECTED + ")",
+    });
+    expect(r.ssh.calls.map((x) => x.kind)).toEqual(["read", "rebind"]);
+    expect(await readFile(file, "utf8")).toBe(HEADER + "\n");
+    expect((await statusFile()).result).toBe("renewed");
+    // A failed status write after a mismatch is still reported, exit code stays 3.
+    const failing = await run({ ssh: fakeSsh({ push: 8, write: 5 }) });
+    expect(failing.out.code).toBe(3);
+    expect(failing.out.line).toEndWith("; status write failed: remote session directory is group/world accessible");
+    // --check with --rebind still only reports.
+    const check = await run({ ssh: fakeSsh(), flags: { check: true, rebind: true } });
+    expect(check.out.line).toBe("xiaomi-session-refresh: check: renewal needed (rebind; collector auth_required since " + REJECTED + ")");
+    expect(check.ssh.calls.map((x) => x.kind)).toEqual(["read"]);
+  });
+}, 30000);
+
+test("spawn runner: stdout over 64 KiB kills ssh at once instead of buffering", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "xq-flood-"));
+  try {
+    const flood = join(dir, "flood");
+    await writeFile(flood, `#!/bin/sh\necho $$ > "${dir}/pid"\nhead -c 4000000 /dev/zero\nexec sleep 30\n`, { mode: 0o700 });
+    const started = Date.now();
+    expect(await lib.spawnRunner({ binary: flood })(["ssh"], null, 10000)).toEqual({ code: 1, stdout: "" });
+    expect(Date.now() - started).toBeLessThan(3000);
+    const pid = Number(await readFile(join(dir, "pid"), "utf8"));
+    expect(() => process.kill(pid, 0)).toThrow();
+    // Exactly 64 KiB is still accepted.
+    const edge = join(dir, "edge");
+    await writeFile(edge, "#!/bin/sh\nhead -c 65536 /dev/zero | tr '\\0' x\n", { mode: 0o700 });
+    const r = await lib.spawnRunner({ binary: edge })(["ssh"], null, 10000);
+    expect(r.code).toBe(0);
+    expect(r.stdout).toBe("x".repeat(65536));
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("readiness expression: boolean only, same-origin usage URL with status 200", () => {
+  const ready = (entries: unknown, type = "resource") =>
+    Function("performance", "return " + lib.READY_JS)({
+      getEntriesByType: (t: string) => {
+        if (entries === "throw") throw new Error("synthetic");
+        return t === type ? entries : [];
+      },
+    });
+  const usage = (name: string, responseStatus: unknown = 200) => ({ name, responseStatus });
+  const cases: [unknown, boolean][] = [
+    [[], false],
+    [[usage(lib.USAGE_URL)], true],
+    [[usage(lib.USAGE_URL + "?t=1")], true],
+    [[usage("not a url"), usage(lib.USAGE_URL)], true],
+    [[usage(lib.USAGE_URL, 401)], false],
+    [[usage(lib.USAGE_URL, 0)], false],
+    [[usage(lib.USAGE_URL, "200")], false],
+    [[usage("https://evil.example/api/v1/tokenPlan/usage")], false],
+    [[usage(lib.USAGE_URL + "/x")], false],
+    [[usage("https://platform.xiaomimimo.com/api/v1/tokenPlan/detail")], false],
+    [[{ responseStatus: 200 }], false],
+    ["throw", false],
+    [null, false],
+  ];
+  for (const [entries, expected] of cases) {
+    const v = ready(entries);
+    expect(typeof v).toBe("boolean");
+    expect(v).toBe(expected);
+  }
+});
+
+test("run deadline bounds every step; the owned tab is closed and the failure recorded", async () => {
+  const tight = { ...T, runMs: 150, navigationMs: 5000, commandMs: 5000, statusSshMs: 5000, vendorMs: 5000, writeSshMs: 5000 };
+  const line = "xiaomi-session-refresh: error (run deadline exceeded; collector auth_required since " + REJECTED + ")";
+  // Console never becomes ready.
+  let started = Date.now();
+  let r = await run({ t: tight, cdp: new FakeCdp({ onNavigate: () => {} }) });
+  expect(Date.now() - started).toBeLessThan(1500);
+  expect(r.out).toEqual({ code: 1, line });
+  expect((r.cdp as FakeCdp).sent.map((s) => s.method)).not.toContain("Network.getCookies");
+  expectOwnedOnly(r.cdp as FakeCdp);
+  expect(r.written.map((w) => w.result)).toEqual(["error"]);
+  expect(r.ssh.calls[0].timeoutMs).toBeLessThanOrEqual(150);
+  // An unanswered DevTools command gets at most the remaining budget.
+  for (const hang of ["Target.attachToTarget", "Page.enable", "Network.getCookies"]) {
+    started = Date.now();
+    r = await run({ t: tight, cdp: new FakeCdp({ hang }) });
+    expect(Date.now() - started).toBeLessThan(1500);
+    expect(r.out).toEqual({ code: 1, line });
+    const timed = (r.cdp as FakeCdp).timing.find((x) => x.method === hang)!;
+    expect(timed.ms).toBeLessThanOrEqual(150);
+    expectOwnedOnly(r.cdp as FakeCdp);
+  }
+  // Validation that never answers is cut at the deadline; nothing is pushed.
+  const hanging: ReturnType<typeof fakeFetch> = fakeFetch({
+    usage: () =>
+      new Promise<Response>((_, reject) =>
+        hanging.calls.at(-1)!.init.signal!.addEventListener("abort", () => reject(new Error("aborted"))),
+      ),
+  });
+  started = Date.now();
+  r = await run({ t: { ...tight, navigationMs: 50 }, cdp: new FakeCdp({ onNavigate: () => {} }), fetch: hanging });
+  expect(Date.now() - started).toBeLessThan(1500);
+  expect(r.out).toEqual({ code: 1, line });
+  expect(hanging.calls.length).toBe(1);
+  expect(r.ssh.calls.map((x) => x.kind)).toEqual(["read", "status"]);
+});
+
+test("abort (SIGTERM/SIGINT) closes the owned tab at once and writes nothing", async () => {
+  const line = "xiaomi-session-refresh: interrupted";
+  // During the console wait.
+  let ac = new AbortController();
+  let r = await run({ signal: ac.signal, cdp: new FakeCdp({ onNavigate: () => ac.abort() }), t: { ...T, navigationMs: 5000 } });
+  expect(r.out).toEqual({ code: 1, line });
+  expectOwnedOnly(r.cdp as FakeCdp);
+  expect((r.cdp as FakeCdp).sent.map((s) => s.method)).not.toContain("Network.getCookies");
+  expect(r.ssh.calls.map((x) => x.kind)).toEqual(["read"]);
+  expect(r.fetcher.calls).toEqual([]);
+  // While a DevTools command is unanswered: the tab is closed immediately, not after the timeout.
+  ac = new AbortController();
+  const cdp = new FakeCdp({ hang: "Network.getCookies" });
+  const pending = run({ signal: ac.signal, cdp, t: { ...T, commandMs: 400 } });
+  while (!cdp.sent.some((s) => s.method === "Network.getCookies")) await Bun.sleep(2);
+  const abortedAt = Date.now();
+  ac.abort();
+  await Bun.sleep(20);
+  const close = cdp.timing.find((x) => x.method === "Target.closeTarget");
+  expect(close).toBeDefined();
+  expect(close!.at - abortedAt).toBeLessThan(20);
+  r = await pending;
+  expect(r.out).toEqual({ code: 1, line });
+  expect(cdp.sent.filter((s) => s.method === "Target.closeTarget").length).toBe(1);
+  expect(r.ssh.calls.map((x) => x.kind)).toEqual(["read"]);
+  // After the browser step but before the push: nothing is installed.
+  ac = new AbortController();
+  r = await run({
+    signal: ac.signal,
+    fetch: fakeFetch({
+      detail: () => {
+        ac.abort();
+        return Response.json({ code: 0, data: {} });
+      },
+    }),
+  });
+  expect(r.out).toEqual({ code: 1, line });
+  expect(r.ssh.calls.map((x) => x.kind)).toEqual(["read"]);
+  // Already aborted: no browser at all.
+  ac = new AbortController();
+  ac.abort();
+  r = await run({ signal: ac.signal });
+  expect(r.out).toEqual({ code: 1, line });
+  expect(r.connects).toBe(0);
+});
+
+test("entrypoint: SIGTERM/SIGINT close the owned target and exit 128+signal", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "xq-signal-"));
+  try {
+    await writeFile(join(dir, "status.json"), collector("auth_required") + "\n");
+    await writeFile(
+      join(dir, "ssh"),
+      `#!/bin/sh\ncase "$*" in *"'sudo'"*) cat "${dir}/status.json" ;; *) cat > /dev/null; echo write >> "${dir}/writes" ;; esac\n`,
+      { mode: 0o700 },
+    );
+    for (const [signal, code] of [["SIGTERM", 143], ["SIGINT", 130]] as const) {
+      let navigated!: () => void;
+      const onNavigate = new Promise<void>((resolve) => (navigated = resolve));
+      const fake = cdpServer((m, reply) => {
+        if (m.method === "Target.createTarget") return reply({ targetId: "T-OWNED" });
+        if (m.method === "Target.attachToTarget") return reply({ sessionId: "S-OWNED" });
+        if (m.method === "Page.navigate") {
+          navigated();
+          return reply({ frameId: "T-OWNED", loaderId: "L-1" });
+        }
+        if (m.method === "Runtime.evaluate") return reply({ result: { type: "boolean", value: false } });
+        reply({});
+      });
+      try {
+        const p = Bun.spawn([process.execPath, join(import.meta.dir, "refresh-session.ts")], {
+          env: { PATH: dir + ":" + process.env.PATH, HOME: dir, ...ENV, XQ_CDP_URL: fake.origin },
+          stdout: "pipe",
+          stderr: "pipe",
+        });
+        await Promise.race([onNavigate, Bun.sleep(10000)]);
+        expect(fake.seen.map((m) => m.method)).toContain("Page.navigate");
+        const killedAt = Date.now();
+        p.kill(signal);
+        expect(await p.exited).toBe(code);
+        expect(Date.now() - killedAt).toBeLessThan(3000);
+        expect(fake.seen.filter((m) => m.method === "Target.closeTarget").map((m) => m.params)).toEqual([
+          { targetId: "T-OWNED" },
+        ]);
+        expect(await new Response(p.stdout).text()).toBe("");
+        expect(await new Response(p.stderr).text()).toBe("xiaomi-session-refresh: interrupted\n");
+        expect((await readdir(dir)).includes("writes")).toBe(false);
+      } finally {
+        fake.stop();
+      }
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}, 30000);
