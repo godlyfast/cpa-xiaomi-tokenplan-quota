@@ -426,9 +426,12 @@ func renewalAdvice(v *sessionInfo, r *renewalInfo, now time.Time) ([]string, []s
 	case "vendor_unavailable":
 		return []string{on + " (" + at + ") could not reach Xiaomi; it retries on its next run."}, []string{run, resumes}
 	case "account_mismatch":
-		if v.State == "missing" || v.State == "invalid_file" {
-			// Nothing to compare against: the refresher never replaces such a file without --rebind.
-			return []string{on + " refused: it cannot compare accounts with a missing or unusable session file.", "With the browser signed in to the bound account, rerun it once with --rebind."}, []string{run, resumes}
+		switch v.State {
+		case "missing":
+			// Nothing to compare against: the refresher never creates the file without --rebind.
+			return []string{on + " refused: no installed session file to compare accounts with.", "If its browser is signed in to the bound account, rerun it once with --rebind."}, []string{run, resumes}
+		case "invalid_file":
+			return []string{on + " refused: the session file is unusable or names another Xiaomi account than its browser.", "If that browser is on the bound account, rerun it once with --rebind."}, []string{run, resumes}
 		}
 		return []string{on + " refused: its browser is signed in to a different Xiaomi account than the collector session, or that has no account id.", "Sign that browser into the bound account and rerun, or use --rebind and update the collector's account label."}, []string{run, resumes}
 	case "not_needed":

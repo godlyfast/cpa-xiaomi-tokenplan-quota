@@ -1554,7 +1554,36 @@ test("entrypoint: SIGTERM/SIGINT close the owned target and exit 128+signal", as
         fake.stop();
       }
     }
+    // The browser answers createTarget 4.5 s after a SIGTERM: longer than a short fallback exit,
+    // shorter than the command timeout. The late tab must still be closed before the process exits.
+    let created!: () => void;
+    const onCreate = new Promise<void>((resolve) => (created = resolve));
+    const slow = cdpServer((m, reply) => {
+      if (m.method === "Target.createTarget") {
+        created();
+        return void setTimeout(() => reply({ targetId: "T-LATE" }), 4500);
+      }
+      reply({});
+    });
+    try {
+      const p = Bun.spawn([process.execPath, join(import.meta.dir, "refresh-session.ts")], {
+        env: { PATH: dir + ":" + process.env.PATH, HOME: dir, ...ENV, XQ_CDP_URL: slow.origin },
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      await Promise.race([onCreate, Bun.sleep(10000)]);
+      const killedAt = Date.now();
+      p.kill("SIGTERM");
+      expect(await p.exited).toBe(143);
+      expect(Date.now() - killedAt).toBeLessThan(13000);
+      expect(slow.seen.filter((m) => m.method === "Target.closeTarget").map((m) => m.params)).toEqual([
+        { targetId: "T-LATE" },
+      ]);
+      expect((await readdir(dir)).includes("writes")).toBe(false);
+    } finally {
+      slow.stop();
+    }
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
-}, 30000);
+}, 45000);

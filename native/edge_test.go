@@ -148,10 +148,11 @@ func TestQuotaFetchMessageStaysBoundedForLongestValidFields(t *testing.T) {
 		state, result, checkedAt string
 		want                     []string
 	}{
-		"stale":            {"invalid_file", "account_mismatch", "2026-10-27T10:00:00.000Z", []string{"cannot reach the collector or write its status", "--check", "unit journal"}},
-		"account-mismatch": {"expired", "account_mismatch", "2026-10-27T11:58:00.000Z", []string{"different Xiaomi account", "no account id"}},
-		"mismatch-no-file": {"missing", "account_mismatch", "2026-10-27T11:58:00.000Z", []string{"cannot compare accounts with a missing or unusable session file", "--rebind"}},
-		"not-needed":       {"invalid_file", "not_needed", "2026-10-27T11:58:00.000Z", []string{"saw no session rejection"}},
+		"stale":             {"invalid_file", "account_mismatch", "2026-10-27T10:00:00.000Z", []string{"cannot reach the collector or write its status", "--check", "unit journal"}},
+		"account-mismatch":  {"expired", "account_mismatch", "2026-10-27T11:58:00.000Z", []string{"different Xiaomi account", "no account id"}},
+		"mismatch-unusable": {"invalid_file", "account_mismatch", "2026-10-27T11:58:00.000Z", []string{"unusable or names another Xiaomi account", "--rebind"}},
+		"mismatch-no-file":  {"missing", "account_mismatch", "2026-10-27T11:58:00.000Z", []string{"no installed session file to compare accounts with", "--rebind"}},
+		"not-needed":        {"invalid_file", "not_needed", "2026-10-27T11:58:00.000Z", []string{"saw no session rejection"}},
 	} {
 		r := renewalBlock(test.result, test.checkedAt, strings.Repeat("x", 160))
 		r["host"] = "h" + strings.Repeat("x", 63)

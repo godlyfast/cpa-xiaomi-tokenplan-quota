@@ -198,12 +198,13 @@ test("missing and unusable session files explain the file requirements", async (
   expect(p.status).toContain("Session file unusable");
   expect(p.help).toContain("cannot use its Xiaomi session file"); expect(p.help).toContain("not a symlink"); expect(p.help).toContain("one Cookie header line of printable ASCII");
   // account_mismatch with no comparable file: blame the file, not the browser account.
-  for (const state of ["missing", "invalid_file"]) {
-    p = await render(rejected(agent("account_mismatch"), state));
-    expect(p.help).toContain("cannot compare Xiaomi accounts with a session file that is missing or unusable");
-    expect(p.help).toContain("rerun the refresher there once with --rebind (no account label change needed)");
-    expect(p.help).not.toContain("signed in to a different Xiaomi account than");
-  }
+  p = await render(rejected(agent("account_mismatch"), "missing"));
+  expect(p.help).toContain("no installed session file to compare Xiaomi accounts with");
+  expect(p.help).toContain("signed in to the account the collector is bound to; then rerun the refresher there once with --rebind");
+  expect(p.help).not.toContain("no account label change");
+  p = await render(rejected(agent("account_mismatch"), "invalid_file"));
+  expect(p.help).toContain("unusable, or names a different Xiaomi account than the renewal browser");
+  expect(p.help).toContain("If it is the bound account, rerun the refresher there once with --rebind; otherwise sign it into the bound account first");
 });
 test("older collectors without session details get generic restart guidance", async () => {
   const { session: _s, renewal: _r, ...old } = rejected(null);

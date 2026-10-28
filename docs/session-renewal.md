@@ -251,7 +251,8 @@ The page and `quota.fetch` errors are generated from the validated snapshot; a r
 | `browser_unavailable` | Renewal browser not running | Start the dedicated browser (signed in), then rerun |
 | `vendor_unavailable` | Agent could not reach Xiaomi | Usually transient; check that host's internet access |
 | `account_mismatch` (session `expired`) | Renewal refused: the renewal browser is signed in to a different Xiaomi account than the collector's current session, or that session has no account id; the session file was not changed | Sign the renewal browser into the bound account at the console, then rerun. Only for a deliberate switch: rerun with `--rebind` and update `ACCOUNT_LABEL` and the binding |
-| `account_mismatch` while the session file is `missing` / `invalid_file` | The agent cannot compare accounts with a missing or unusable file and never replaces it automatically | Confirm the renewal browser is signed in to the bound account, then run the refresher once with `--rebind` (no `ACCOUNT_LABEL` change) |
+| `account_mismatch` while the session file is `missing` | No installed file to compare accounts with; the refresher never creates one automatically | Check the renewal browser's account at the console; if it is the bound account, run the refresher once with `--rebind` |
+| `account_mismatch` while the session file is `invalid_file` | The installed file is unusable, or names another account than the browser; file unchanged | Check the browser's account first; if bound, `--rebind` once; otherwise sign in to the bound account, or switch deliberately and update `ACCOUNT_LABEL` |
 | `error` | Agent failed unexpectedly | Read the unit journal, then rerun |
 | `not_needed` after the rejection | Agent saw no session rejection (race or clock difference) | Wait for the next run, or run it now |
 | Report older than 15 min | Host asleep or timer stopped, **or** the agent runs but cannot reach the collector or write its status (ssh, sudo, Docker or the remote session directory) | Wake the host or restart its timer. If it is awake and the timer runs, run the refresher with `--check` there and read its unit journal (ssh access, sudo rule, container name, session directory). Or replace the session by hand |
@@ -266,18 +267,19 @@ While the session is blocked and `manualCommand` is set, the page adds “Run on
 
 Install a session by hand on the collector host, as the user that owns the session directory (the collector UID). Use only the platform cookies as one Cookie header value (`api-platform_serviceToken=…; api-platform_slh=…; api-platform_ph=…; userId=…`), taken from a browser signed in to the bound Xiaomi account; never include `account.xiaomi.com` cookies. The value must be printable ASCII on one line and contain exactly one `userId=…` cookie. Otherwise the collector rejects the file as `invalid_file`, or the refresher's next renewal reports `account_mismatch` instead of replacing it.
 
-Use bash 5 or zsh. `read -rs` keeps the value out of argv, shell history and the terminal echo. The block reads first, before it creates anything, and installs only a value that looks like a usable session (printable ASCII with a `userId=` cookie); anything else prints `not installed` and leaves the current session and directory unchanged. Set `d` to the dedicated session directory:
+Use bash or zsh. `read -rs` keeps the value out of argv, shell history and the terminal echo. The block reads first, before it creates anything, and installs only a value that looks like a usable session (a `userId=` cookie, printable ASCII only); anything else prints `not installed` and leaves the current session and directory unchanged. It contains no `!` (interactive history expansion) and no inline comments (zsh without `INTERACTIVE_COMMENTS`). Set `d` to the dedicated session directory:
 
 ```sh
 umask 077; d=/srv/xiaomi-quota/session; t=
 printf 'Cookie header value: ' >&2
-if IFS= read -rs c && [[ $c == *userId=?* && $c != *[!\ -~]* ]] &&
+if IFS= read -rs c && case $c in *userId=?*) true;; *) false;; esac &&
+  printf '%s' "$c" | LC_ALL=C grep -qv '[^ -~]' &&
   t=$(mktemp "$d/.mimo_session.XXXXXXXX") && printf '%s\n' "$c" > "$t" &&
   chmod 600 "$t" && mv -fT "$t" "$d/mimo_session"
 then echo; echo installed; else echo; [ -z "$t" ] || rm -f "$t"; echo 'not installed' >&2; fi; unset c t
 ```
 
-Paste the block and press Enter. It prints `Cookie header value:` and waits without echo; then paste the value and press Enter. Ctrl-D, an empty line or an unusable value prints `not installed`. The block has no inline comments, so it also works in zsh without `INTERACTIVE_COMMENTS`. The check is a shape check only: Xiaomi has not validated the value, and the collector still applies its own file rules.
+Paste the block and press Enter. When it prints `Cookie header value:` and waits without echo, paste the value and press Enter. Ctrl-D, an empty line or an unusable value prints `not installed`. The check is a shape check only: Xiaomi has not validated the value, and the collector still applies its own file rules. Verified in interactive bash 5.3 and zsh 5.9 (C and UTF-8 locales): a synthetic value was installed with mode 0600 and appeared in neither the terminal output nor the history file.
 
 A blocked collector loads it within the session-check interval and a healthy one on its next poll; no restart (with the directory mount).
 
