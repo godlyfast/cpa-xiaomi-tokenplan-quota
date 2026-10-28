@@ -45,9 +45,10 @@ function sessionGuide(s,session,r,last){
  else if(k==='signin_required'){happened.push(agent+' found its browser not signed in to Xiaomi.');todo.push('On '+host+', sign in at the Xiaomi console (link below) in the renewal browser, then rerun the session refresher there.')}
  else if(k==='browser_unavailable'){happened.push(agent+' could not reach the renewal browser; it is probably not running.');todo.push('Start the renewal browser on '+host+' (it must be signed in to the Xiaomi console), then rerun the session refresher there.')}
  else if(k==='vendor_unavailable'){happened.push(agent+' could not reach Xiaomi to validate a new session.');todo.push('Usually transient: the agent retries on its next run. If it persists, check the internet connection of '+host+'.')}
- else if(k==='not_needed'){happened.push(agent+' found its browser session healthy, but '+(st==='missing'?'the collector has no session file':st==='invalid_file'?'the collector cannot use its session file':'Xiaomi rejected the collector\'s copy')+'.');todo.push('Rerun the session refresher on '+host+' with --force to copy a fresh session.')}
+ // not_needed after the rejection: the check raced it or the two hosts' clocks differ; the next run sees auth_required.
+ else if(k==='not_needed'){happened.push(agent+' reported the collector healthy, so it did not renew; the problem appeared after that check (or the two machines\' clocks differ).');todo.push('Wait for the next renewal run on '+host+' (every few minutes), or run it now.')}
  else{happened.push(agent+' failed unexpectedly.');todo.push('Check the session refresher\'s output on '+host+', then rerun it.')}
- if(r&&r.manualCommand&&k!=='renewed')todo.push([k==='not_needed'&&!/(^| )--force( |$)/.test(r.manualCommand)?'Run on '+host+', adding --force: ':'Run on '+host+': ',r.manualCommand]);
+ if(r&&r.manualCommand&&k!=='renewed')todo.push(['Run on '+host+': ',r.manualCommand]);
  if(k==='none'||st==='missing'||st==='invalid_file')todo.push('Or replace the session file by hand with one Cookie header line from a browser signed in to the Xiaomi console: write it to a temporary file in the session directory, make it owner-only (mode 0600, owned by the collector user), then rename it over the session file.');
  if(k!=='renewed')todo.push('The collector reloads a replaced session file within about 15 s, no restart needed'+(session.nextAttemptAt?'; otherwise it next contacts Xiaomi '+when(session.nextAttemptAt):'')+'.');
  return[happened,todo]}

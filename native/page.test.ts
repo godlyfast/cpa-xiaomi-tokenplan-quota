@@ -146,8 +146,7 @@ test("rejected session explains what happened and what to do for every renewal s
     ["browser", agent("browser_unavailable"), ["could not reach the renewal browser", "Start the renewal browser on synthetic-host"]],
     ["vendor", agent("vendor_unavailable"), ["could not reach Xiaomi", "next run"]],
     ["error", agent("error"), ["failed unexpectedly", "output on synthetic-host"]],
-    ["not needed", agent("not_needed"), ["found its browser session healthy", "Xiaomi rejected the collector's copy", "with --force", "Run on synthetic-host, adding --force:"]],
-    ["not needed, forced command", agent("not_needed", iso(-2 * MIN), "bun refresher/refresh-session.ts --force"), ["with --force", "Run on synthetic-host: "]],
+    ["not needed", agent("not_needed"), ["reported the collector healthy, so it did not renew", "clocks differ", "Wait for the next renewal run on synthetic-host", "Run on synthetic-host: "]],
     ["stale agent", agent("signin_required", iso(-40 * MIN)), ["last reported 40 min ago (", "— browser not signed in to Xiaomi", "asleep or its renewal timer stopped"]],
   ];
   for (const [name, renewal, wants] of cases) {
@@ -175,7 +174,7 @@ test("manual renewal command renders verbatim as code text", async () => {
 test("missing and unusable session files explain the file requirements", async () => {
   let p = await render(rejected(agent("not_needed"), "missing"));
   expect(p.status).toContain("Session file missing");
-  expect(p.help).toContain("cannot find its Xiaomi session file. First noticed 1 h ago ("); expect(p.help).toContain("owner-only"); expect(p.help).toContain("the collector has no session file");
+  expect(p.help).toContain("cannot find its Xiaomi session file. First noticed 1 h ago ("); expect(p.help).toContain("owner-only"); expect(p.help).toContain("reported the collector healthy");
   p = await render(rejected(null, "invalid_file"));
   expect(p.status).toContain("Session file unusable");
   expect(p.help).toContain("cannot use its Xiaomi session file"); expect(p.help).toContain("not a symlink"); expect(p.help).toContain("one Cookie header line");

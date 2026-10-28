@@ -409,7 +409,7 @@ func renewalAdvice(v *sessionInfo, r *renewalInfo, now time.Time) (string, strin
 	case "vendor_unavailable":
 		return on + " (" + at + ") could not reach Xiaomi; it retries on its next run.", run
 	case "not_needed":
-		return on + " (" + at + ") found its browser session healthy; rerun the refresher with --force.", run
+		return on + " (" + at + ") reported the collector healthy; its next run should notice the rejection and renew.", run
 	default:
 		return on + " (" + at + ") failed unexpectedly; check its output, then rerun the refresher.", run
 	}

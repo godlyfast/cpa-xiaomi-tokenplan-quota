@@ -83,7 +83,7 @@ func TestQuotaFetchFailuresAreSpecificAndActionable(t *testing.T) {
 		{"expired-browser", edit(t, auth, agent("browser_unavailable", "2026-10-27T11:58:00.000Z")), 0, []string{"renewal browser is not running", "start it"}, nil},
 		{"expired-vendor", edit(t, auth, agent("vendor_unavailable", "2026-10-27T11:58:00.000Z")), 0, []string{"could not reach Xiaomi", "next run"}, nil},
 		{"expired-error", edit(t, auth, agent("error", "2026-10-27T11:58:00.000Z")), 0, []string{"failed unexpectedly", "rerun"}, nil},
-		{"expired-not-needed", edit(t, auth, agent("not_needed", "2026-10-27T11:58:00.000Z")), 0, []string{"--force"}, nil},
+		{"expired-not-needed", edit(t, auth, agent("not_needed", "2026-10-27T11:58:00.000Z")), 0, []string{"reported the collector healthy", "next run should notice"}, nil},
 		{"expired-agent-stale", edit(t, auth, agent("not_needed", "2026-10-27T10:30:00.000Z")), 0, []string{"last reported at 2026-10-27T10:30:00Z", "asleep", "timer"}, nil},
 		{"expired-agent-before-rejection", edit(t, auth, map[string]any{"session": sessionBlock("expired", "2026-10-27T11:59:00.000Z"), "renewal": renewalBlock("not_needed", "2026-10-27T11:55:00.000Z", nil)}), 0, []string{"before the rejection", "next run"}, nil},
 		{"missing", edit(t, auth, map[string]any{"session": sessionBlock("missing", "2026-10-27T11:00:00.000Z")}), 0, []string{"session file is missing", "since 2026-10-27T11:00:00Z", "owner-only regular file", "Cookie header"}, nil},
