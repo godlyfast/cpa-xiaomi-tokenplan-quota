@@ -108,6 +108,8 @@ export interface FetchOptions {
   signal?: AbortSignal;
   timeoutMs?: number;
 }
+// A sendable session: 1-16384 printable ASCII characters (a valid Cookie header value).
+export const SESSION_COOKIE = /^[\x20-\x7e]{1,16384}$/;
 const ORIGIN = "https://platform.xiaomimimo.com";
 const MAX_BODY = 1024 * 1024;
 export async function fetchMimoSnapshot(
@@ -115,7 +117,7 @@ export async function fetchMimoSnapshot(
   now: Date,
   options: FetchOptions,
 ): Promise<QuotaSnapshot> {
-  if (!cookie || cookie.length > 16384 || /[\x00-\x1f\x7f]/.test(cookie))
+  if (typeof cookie !== "string" || !SESSION_COOKIE.test(cookie))
     throw new QuotaError("auth_required");
   const fetcher = options.fetch ?? fetch;
   const signal = options.signal

@@ -112,6 +112,13 @@ test("missing, public-readable, empty, oversized, foreign or symlinked secrets f
       [path, 0o600, " \n\t ", "invalid_file", true, null],
       [path, 0o600, "a=b\x01c", "invalid_file", true, null],
       [path, 0o600, "a=" + "b".repeat(16384), "invalid_file", true, null],
+      // Fits the byte cap but is one character over the 16384-character limit.
+      [path, 0o600, "a=" + "b".repeat(16383), "invalid_file", true, null],
+      // Not a valid HTTP header value: typographic, Latin-1, replacement char, invalid UTF-8.
+      [path, 0o600, "a=b…", "invalid_file", true, null],
+      [path, 0o600, "a=é", "invalid_file", true, null],
+      [path, 0o600, "a=�", "invalid_file", true, null],
+      [path, 0o600, Buffer.from([0x61, 0x3d, 0xff]), "invalid_file", true, null],
       [path, 0o600, "x", "invalid_file", true, 4242],
       [link, 0o600, "x", "invalid_file", false, null],
       [dir, 0o600, "x", "invalid_file", false, null],
@@ -420,6 +427,131 @@ test("missing session file never reaches Xiaomi and recovers when it appears", a
     }
   } finally {
     await rm(dir, { recursive: true, force: true });
+  }
+});
+test("a missing or unusable session file schedules no Xiaomi attempt", async () => {
+  await secret(async (path) => {
+    let now = at(0),
+      auth = false;
+    const sent: string[] = [];
+    const c = createCollector({
+      cookieFile: path,
+      accountLabel: "Test",
+      now: () => now,
+      pollIntervalMs: 2,
+      sessionCheckIntervalMs: 2,
+      authRetryIntervalMs: 1000,
+      log: quiet,
+      fetchSnapshot: async (cookie) => {
+        sent.push(cookie);
+        if (auth) throw new QuotaError("auth_required");
+        return snap();
+      },
+    });
+    try {
+      expect((await quota(c)).session.nextAttemptAt).toBe(iso(2));
+      await rm(path);
+      await until(async () => (await quota(c)).session.state === "missing");
+      const calls = sent.length;
+      now = at(3 * 3600000);
+      await Bun.sleep(30);
+      expect((await quota(c)).session).toEqual({
+        state: "missing",
+        updatedAt: null,
+        rejectedAt: iso(0),
+        lastAttemptAt: iso(0),
+        nextAttemptAt: null,
+      });
+      await replace(path, "session=synthetic-secret\n", 0o644);
+      await until(async () => (await quota(c)).session.state === "invalid_file");
+      await Bun.sleep(30);
+      const invalid = await quota(c);
+      expect(invalid.error).toBe("auth_required");
+      expect(invalid.session).toEqual({
+        state: "invalid_file",
+        updatedAt: await mtime(path),
+        rejectedAt: iso(3 * 3600000),
+        lastAttemptAt: iso(0),
+        nextAttemptAt: null,
+      });
+      expect(sent.length).toBe(calls);
+      // A rejected session keeps its retry time.
+      auth = true;
+      await chmod(path, 0o600);
+      await until(async () => (await quota(c)).session.state === "expired");
+      expect((await quota(c)).session).toMatchObject({
+        lastAttemptAt: iso(3 * 3600000),
+        nextAttemptAt: iso(3 * 3600000 + 1000),
+      });
+      expect(sent.length).toBe(calls + 1);
+    } finally {
+      await c.close();
+    }
+  });
+});
+test("an unusable replacement stays blocked and watched and is never sent", async () => {
+  await secret(async (path) => {
+    let now = at(0);
+    const sent: string[] = [];
+    const c = createCollector({
+      cookieFile: path,
+      accountLabel: "Test",
+      now: () => now,
+      pollIntervalMs: 3600000,
+      sessionCheckIntervalMs: 2,
+      log: quiet,
+      fetchSnapshot: async (cookie) => {
+        sent.push(cookie);
+        if (cookie === "session=synthetic-secret")
+          throw new QuotaError("auth_required");
+        return snap();
+      },
+    });
+    try {
+      expect((await quota(c)).session.state).toBe("expired");
+      now = at(60000);
+      await replace(path, "session=synthetic-renewed…\n");
+      await until(async () => (await quota(c)).session.state === "invalid_file");
+      await Bun.sleep(20);
+      const invalid = await quota(c);
+      expect(invalid.error).toBe("auth_required");
+      expect(invalid.session).toMatchObject({
+        rejectedAt: iso(60000),
+        lastAttemptAt: iso(0),
+        nextAttemptAt: null,
+      });
+      expect(sent).toEqual(["session=synthetic-secret"]);
+      // Only the session-check tick can pick this up (the poll is hourly).
+      const longest = "s=" + "x".repeat(16382);
+      await replace(path, longest + "\n");
+      await until(async () => (await quota(c)).session.state === "ok");
+      expect(sent).toEqual(["session=synthetic-secret", longest]);
+    } finally {
+      await c.close();
+    }
+  });
+});
+test("fetchMimoSnapshot refuses a Cookie outside printable ASCII without sending it", async () => {
+  for (const cookie of [
+    "",
+    "a=b…",
+    "a=é",
+    "a=�",
+    "a=b\x7f",
+    "a=" + "b".repeat(16383),
+    null as unknown as string,
+  ]) {
+    let calls = 0;
+    const error = await fetchMimoSnapshot(cookie, at(0), {
+      accountLabel: "Test",
+      fetch: async () => {
+        calls++;
+        return Response.json({});
+      },
+    }).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(QuotaError);
+    expect((error as QuotaError).code).toBe("auth_required");
+    expect(calls).toBe(0);
   }
 });
 test("fixing an invalid session file triggers a refresh", async () => {

@@ -42,6 +42,7 @@ test("valid status parses exactly, without schemaVersion", () => {
     "signin_required",
     "browser_unavailable",
     "vendor_unavailable",
+    "account_mismatch",
     "error",
   ])
     expect(

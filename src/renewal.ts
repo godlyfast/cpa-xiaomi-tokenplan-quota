@@ -17,6 +17,7 @@ const RESULTS: readonly RenewalResult[] = [
   "signin_required",
   "browser_unavailable",
   "vendor_unavailable",
+  "account_mismatch",
   "error",
 ];
 const UTC = /^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d{1,3}))?Z$/;
