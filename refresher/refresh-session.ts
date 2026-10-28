@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 // Renews the collector's Xiaomi session from a signed-in loopback browser.
-// Usage: bun refresh-session.ts [--check] [--force]; configuration via XQ_* env.
+// Usage: bun refresh-session.ts [--check] [--force] [--rebind]; configuration via XQ_* env.
 import { hostname } from "node:os";
 import {
   ConfigError,
@@ -25,11 +25,31 @@ try {
   );
   process.exit(1);
 }
+// SIGTERM (unit stop or start timeout) and SIGINT: the run closes its owned tab
+// (bounded by its 2 s close timeout) and writes nothing more; exit 128+signal.
+const interrupt = new AbortController();
+let signalled = 0;
+const finish = (code: number): never => {
+  console.error(PREFIX + "interrupted");
+  process.exit(code);
+};
+for (const [name, code] of [
+  ["SIGTERM", 143],
+  ["SIGINT", 130],
+] as const)
+  process.on(name, () => {
+    if (signalled) return;
+    signalled = code;
+    interrupt.abort();
+    setTimeout(() => finish(code), 3000);
+  });
 const outcome = await runRefresh(config, flags, {
   ssh: spawnRunner(),
-  connectBrowser: (origin) => connectBrowser(origin),
+  connectBrowser: (origin, timeoutMs) => connectBrowser(origin, { timeoutMs }),
   fetch: (input, init) => fetch(input, init),
   now: () => new Date(),
+  signal: interrupt.signal,
 });
+if (signalled) finish(signalled);
 (outcome.code === 0 ? console.log : console.error)(outcome.line);
 process.exit(outcome.code);
