@@ -4,6 +4,7 @@ CPA_BINARY=/path/to/CLIProxyAPI NATIVE_PLUGIN=/path/to/plugin.so python3 native/
 Synthetic data only; no real config, auth directories, provider calls or Docker changes.
 """
 import contextlib
+from datetime import datetime, timedelta, timezone
 import json
 import os
 from pathlib import Path
@@ -19,6 +20,13 @@ from urllib.request import Request, urlopen
 
 HERE = Path(__file__).resolve().parent
 fixture = {"schemaVersion": 1, "region": "sgp", "accountLabel": "Synthetic <account>", "planName": "Pro", "pools": [{"id": "plan", "label": "Plan", "unit": "credits", "used": "60", "limit": "100", "remaining": "40", "remainingPercent": "40.00"}], "fetchedAt": None, "expiresAt": "2099-11-27T12:00:00Z", "expired": False, "resetsAt": None, "stale": False, "error": None}
+def stamp(minutes=0):
+    return (datetime.now(timezone.utc) + timedelta(minutes=minutes)).isoformat(timespec='milliseconds').replace('+00:00', 'Z')
+# v0.3.0 collector additions; host label and command are synthetic.
+def session(state='ok', rejected=None):
+    return {'state': state, 'updatedAt': stamp(-180), 'rejectedAt': rejected, 'lastAttemptAt': stamp(-1), 'nextAttemptAt': stamp(4)}
+def renewal(result='not_needed', command=None):
+    return {'checkedAt': stamp(-2), 'result': result, 'renewedAt': stamp(-180), 'host': 'synthetic-host', 'manualCommand': command}
 class Collector(BaseHTTPRequestHandler):
     def do_GET(self):
         assert self.path == '/v1/quota'
@@ -125,7 +133,32 @@ plugins:
                 assert json.loads(request(route)[1])['error'] == 'auth_required'
                 fixture['stale'] = False; fixture['error'] = None
                 assert request('/v0/management/quota/fetch', {'auth_index': index})[0] == 200
-            print(json.dumps({'realCABI': True, 'registeredAndLoaded': True, 'publicShellOnly': True, 'unauthenticatedSnapshot': 401, 'quotaFraction': .4, 'authFailureRecovery': True, 'syntheticOnly': True}))
+                # Fresh v0.3.0 shape: session/renewal pass through and native quota stays available.
+                fixture['session'] = session(); fixture['renewal'] = renewal()
+                status, body, _ = request(route); data = json.loads(body)
+                assert status == 200 and data['session'] == fixture['session'] and data['renewal'] == fixture['renewal'], (status, data)
+                assert request('/v0/management/quota/fetch', {'auth_index': index})[0] == 200
+                # Expired session with a renewal report: verbose, bounded guidance through the real host.
+                command = 'bun refresher/refresh-session.ts --label "<synthetic>"'
+                fixture.update(stale=True, error='auth_required', session=session('expired', stamp(-30)), renewal=renewal('signin_required', command))
+                status, body, _ = request(route); data = json.loads(body)
+                assert status == 200 and data['session']['state'] == 'expired' and data['renewal']['manualCommand'] == command, (status, data)
+                status, body, _ = request('/v0/management/quota/fetch', {'auth_index': index})
+                assert status == 502, (status, body)
+                text = json.loads(body)['error']
+                for want in ('Xiaomi rejected the collector session', 'Renewal agent on synthetic-host', 'not signed in', f'Run on synthetic-host: `{command}`', 'Details: Plugins'):
+                    assert want in text, (want, text)
+                assert len(text.encode()) <= 400 + len('failed to fetch quota: '), text
+                # Invalid renewal data fails closed for the whole snapshot.
+                fixture['renewal'] = dict(renewal(), host='.bad host')
+                assert request(route)[0] == 503 and request('/v0/management/quota/fetch', {'auth_index': index})[0] == 502
+                # Older collector shape: no session/renewal keys anywhere, native quota still works.
+                for key in ('session', 'renewal'): fixture.pop(key)
+                fixture.update(stale=False, error=None)
+                status, body, _ = request(route); data = json.loads(body)
+                assert status == 200 and 'session' not in data and 'renewal' not in data, data
+                assert request('/v0/management/quota/fetch', {'auth_index': index})[0] == 200
+            print(json.dumps({'realCABI': True, 'registeredAndLoaded': True, 'publicShellOnly': True, 'unauthenticatedSnapshot': 401, 'quotaFraction': .4, 'authFailureRecovery': True, 'sessionRenewalPassThrough': True, 'expiredSessionGuidance': True, 'invalidRenewalFailsClosed': True, 'oldCollectorShape': True, 'syntheticOnly': True}))
         finally:
             collector.shutdown(); collector.server_close()
 

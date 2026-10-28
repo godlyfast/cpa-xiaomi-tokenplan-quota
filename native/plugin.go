@@ -19,7 +19,7 @@ import (
 )
 
 const pluginID = "xiaomi-tokenplan-quota"
-const version = "0.2.1"
+const version = "0.3.0"
 const maxSnapshot = 32768
 const snapshotPath = "/v0/management/plugins/" + pluginID + "/snapshot"
 const resourcePath = "/v0/resource/plugins/" + pluginID + "/quota"
@@ -28,6 +28,12 @@ const resourcePath = "/v0/resource/plugins/" + pluginID + "/quota"
 var quotaHTML []byte
 var decimal = regexp.MustCompile(`^(0|[1-9][0-9]*)(\.[0-9]+)?$`)
 var unavailable = errors.New("collector unavailable")
+
+// Session/renewal timestamps exactly as Date#toISOString() emits them (UTC only).
+var utcStamp = regexp.MustCompile(`^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d{1,3})?Z$`)
+var hostLabel = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
+var sessionStates = map[string]bool{"unknown": true, "ok": true, "expired": true, "missing": true, "invalid_file": true}
+var renewalResults = map[string]bool{"not_needed": true, "renewed": true, "signin_required": true, "browser_unavailable": true, "vendor_unavailable": true, "error": true}
 
 type config struct {
 	CollectorURL string `yaml:"collector_url"`
@@ -68,6 +74,20 @@ type pool struct {
 	Remaining        string  `json:"remaining"`
 	RemainingPercent *string `json:"remainingPercent"`
 }
+type sessionInfo struct {
+	State         string  `json:"state"`
+	UpdatedAt     *string `json:"updatedAt"`
+	RejectedAt    *string `json:"rejectedAt"`
+	LastAttemptAt *string `json:"lastAttemptAt"`
+	NextAttemptAt *string `json:"nextAttemptAt"`
+}
+type renewalInfo struct {
+	CheckedAt     string  `json:"checkedAt"`
+	Result        string  `json:"result"`
+	RenewedAt     *string `json:"renewedAt"`
+	Host          string  `json:"host"`
+	ManualCommand *string `json:"manualCommand"`
+}
 type snapshot struct {
 	SchemaVersion int     `json:"schemaVersion"`
 	Region        string  `json:"region"`
@@ -80,9 +100,39 @@ type snapshot struct {
 	ResetsAt      *string `json:"resetsAt"`
 	Stale         bool    `json:"stale"`
 	Error         *string `json:"error"`
+	// v0.3.0 collectors; absent and null are identical (older collectors omit both).
+	Session *sessionInfo `json:"session,omitempty"`
+	Renewal *renewalInfo `json:"renewal,omitempty"`
 }
 
 func textOK(s string) bool { return len(s) <= 256 && strings.IndexFunc(s, unicode.IsControl) == -1 }
+func stamp(s *string, nullable bool) bool {
+	if s == nil {
+		return nullable
+	}
+	_, err := time.Parse(time.RFC3339Nano, *s)
+	return err == nil && utcStamp.MatchString(*s)
+}
+func command(s *string) bool {
+	if s == nil {
+		return true
+	}
+	if len(*s) == 0 || len(*s) > 160 {
+		return false
+	}
+	for i := 0; i < len(*s); i++ {
+		if (*s)[i] < 0x20 || (*s)[i] > 0x7e {
+			return false
+		}
+	}
+	return true
+}
+func (v *sessionInfo) valid() bool {
+	return v == nil || (sessionStates[v.State] && stamp(v.UpdatedAt, true) && stamp(v.RejectedAt, true) && stamp(v.LastAttemptAt, true) && stamp(v.NextAttemptAt, true))
+}
+func (v *renewalInfo) valid() bool {
+	return v == nil || (renewalResults[v.Result] && stamp(&v.CheckedAt, false) && stamp(v.RenewedAt, true) && hostLabel.MatchString(v.Host) && command(v.ManualCommand))
+}
 func number(s string) (*big.Rat, error) {
 	if len(s) > 128 || !decimal.MatchString(s) {
 		return nil, unavailable
@@ -101,7 +151,7 @@ func decodeSnapshot(b []byte, now time.Time) (snapshot, error) {
 	if json.Unmarshal(b, &s) != nil || s.SchemaVersion != 1 || s.Region != "sgp" || s.AccountLabel == "" || !textOK(s.AccountLabel) || (s.PlanName != nil && !textOK(*s.PlanName)) || s.ResetsAt != nil || len(s.Pools) > 3 {
 		return s, unavailable
 	}
-	if s.Error != nil && *s.Error != "auth_required" && *s.Error != "unavailable" && *s.Error != "schema_changed" {
+	if (s.Error != nil && *s.Error != "auth_required" && *s.Error != "unavailable" && *s.Error != "schema_changed") || !s.Session.valid() || !s.Renewal.valid() {
 		return s, unavailable
 	}
 	ids := map[string]bool{}
@@ -215,16 +265,16 @@ func (p *plugin) handle(method string, b []byte) []byte {
 		}
 		s, err := p.snapshot(c)
 		if err != nil {
-			return fail("quota_unavailable", "collector unavailable")
+			return fail("quota_unavailable", message("The plugin could not read a valid snapshot from its collector_url: the collector is not running, not on the gateway's network, or returned an invalid snapshot (collector/plugin version mismatch). No quota is asserted."))
 		}
 		if s.Stale || s.Error != nil || s.Expired == nil || *s.Expired {
-			return fail("quota_unavailable", "quota is stale, expired, or requires collector reauthentication; open plugin page for status")
+			return fail("quota_unavailable", explain(s, p.now()))
 		}
 		return ok(normalize(s))
 	case "quota.reset":
 		return fail("unsupported", "quota reset is not supported")
 	case "management.register":
-		return ok(map[string]any{"routes": []map[string]string{{"Method": "GET", "Path": snapshotPath}}, "resources": []map[string]string{{"Path": "/quota", "Menu": "Xiaomi Token Plan", "Description": "Singapore Credits, freshness, and session status (management authentication required)."}}})
+		return ok(map[string]any{"routes": []map[string]string{{"Method": "GET", "Path": snapshotPath}}, "resources": []map[string]string{{"Path": "/quota", "Menu": "Xiaomi Token Plan", "Description": "Singapore Credits, freshness, session and renewal guidance (management authentication required)."}}})
 	case "management.handle":
 		var r struct {
 			Method, Path string
@@ -255,6 +305,114 @@ func (p *plugin) handle(method string, b []byte) []byte {
 }
 func response(status int, contentType string, body []byte) []byte {
 	return ok(map[string]any{"StatusCode": status, "Headers": http.Header{"Content-Type": {contentType}, "Cache-Control": {"no-store"}, "X-Content-Type-Options": {"nosniff"}, "Referrer-Policy": {"no-referrer"}, "Content-Security-Policy": {"default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; form-action 'none'; base-uri 'none'; frame-ancestors 'self'"}}, "Body": body})
+}
+
+const detailsTail = "Details: Plugins → Xiaomi Token Plan."
+
+// Single-line quota.fetch guidance from validated snapshot fields only. Sentences keep their order;
+// any that would push the message past 400 bytes (including the fixed tail) is skipped.
+func message(parts ...string) string {
+	out := ""
+	for _, part := range parts {
+		if part != "" && len(out)+len(part)+1+len(detailsTail) <= 400 {
+			out += part + " "
+		}
+	}
+	return out + detailsTail
+}
+
+// Validated timestamp, normalized to second-precision UTC to save message space.
+func utc(s string) string {
+	t, _ := time.Parse(time.RFC3339Nano, s)
+	return t.UTC().Format("2006-01-02T15:04:05Z")
+}
+func opt(prefix string, s *string, suffix string) string {
+	if s == nil {
+		return ""
+	}
+	return prefix + utc(*s) + suffix
+}
+func deref(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
+}
+func explain(s snapshot, now time.Time) string {
+	last := "No quota fetched yet."
+	if s.FetchedAt != nil {
+		last = "Last good quota: " + utc(*s.FetchedAt) + "."
+	}
+	var attempt, next *string
+	if s.Session != nil {
+		attempt, next = s.Session.LastAttemptAt, s.Session.NextAttemptAt
+	}
+	switch {
+	case s.Error != nil && *s.Error == "auth_required":
+		return explainSession(s, now, last)
+	case s.Error != nil && *s.Error == "schema_changed":
+		return message("Xiaomi's console API changed: the collector rejected an unexpected response"+opt(" at ", attempt, "")+".", "Quota stays unavailable until the collector code is updated; check the plugin repository for a release.", last)
+	case s.Error != nil:
+		return message("The collector could not reach Xiaomi (or got a non-auth error) on its last attempt"+opt(" at ", attempt, "")+"; it retries every 5 min"+opt(", next ~", next, "")+".", last, "If this persists, check the collector's outbound network.")
+	case s.Expired != nil && *s.Expired:
+		head := "Xiaomi reports the Token Plan subscription as expired" + opt(" (listed expiry ", s.ExpiresAt, ")") + "."
+		if at, err := time.Parse(time.RFC3339Nano, deref(s.ExpiresAt)); err == nil && !now.Before(at) {
+			head = "Xiaomi Token Plan subscription expired at " + utc(*s.ExpiresAt) + "."
+		}
+		return message(head, "Renew it in the Xiaomi console (platform.xiaomimimo.com); quota returns on the collector's next poll (every 5 min).", last)
+	default:
+		return message("No completed collector poll in over 10 min.", last, "Check that the collector is running (it polls Xiaomi every 5 min) and that its clock matches CPA's.")
+	}
+}
+func explainSession(s snapshot, now time.Time, last string) string {
+	v := s.Session
+	if v == nil {
+		return message("Xiaomi rejected the collector session or the collector cannot read its session file (~24 h lifetime).", "Replace the session file with fresh cookies from a browser signed in to the Xiaomi console, then restart this pre-0.3.0 collector: it stops polling after a rejection.", last)
+	}
+	head, fix := "Xiaomi rejected the collector session"+opt(" at ", v.RejectedAt, "")+" (~24 h lifetime).", ""
+	switch v.State {
+	case "missing":
+		head, fix = "The collector's Xiaomi session file is missing"+opt(" (since ", v.RejectedAt, ")")+".", "It must be an owner-only regular file holding one Cookie header line."
+	case "invalid_file":
+		head, fix = "The collector cannot use its Xiaomi session file"+opt(" (since ", v.RejectedAt, ")")+".", "It must be an owner-only regular file (no symlink) owned by the collector user, holding one Cookie header line."
+	}
+	agent, run := renewalAdvice(v, s.Renewal, now)
+	return message(head, fix, agent, run, "The collector resumes within seconds of a new session file.", last)
+}
+func renewalAdvice(v *sessionInfo, r *renewalInfo, now time.Time) (string, string) {
+	if r == nil {
+		return "No renewal agent reports: run refresher/refresh-session.ts where a browser is signed in to the Xiaomi console, or replace the session file.", ""
+	}
+	checked, _ := time.Parse(time.RFC3339Nano, r.CheckedAt)
+	on, at, run := "Renewal agent on "+r.Host, utc(r.CheckedAt), ""
+	if r.ManualCommand != nil {
+		run = "Run on " + r.Host + ": `" + *r.ManualCommand + "`."
+	}
+	if now.Sub(checked) > 15*time.Minute {
+		return on + " last reported at " + at + " (" + r.Result + "): host likely asleep or its timer stopped.", run
+	}
+	if v.RejectedAt != nil {
+		if rejected, _ := time.Parse(time.RFC3339Nano, *v.RejectedAt); checked.Before(rejected) {
+			return on + " last checked at " + at + ", before the rejection; its next run should renew the session.", run
+		}
+	}
+	switch r.Result {
+	case "renewed":
+		if r.RenewedAt != nil {
+			at = utc(*r.RenewedAt)
+		}
+		return on + " installed a new session at " + at + "; waiting for the collector to pick it up.", ""
+	case "signin_required":
+		return on + " (" + at + "): browser not signed in to Xiaomi; sign in at the Xiaomi console there, then rerun the refresher.", run
+	case "browser_unavailable":
+		return on + " (" + at + "): renewal browser is not running; start it, then rerun the refresher.", run
+	case "vendor_unavailable":
+		return on + " (" + at + ") could not reach Xiaomi; it retries on its next run.", run
+	case "not_needed":
+		return on + " (" + at + ") found its browser session healthy; rerun the refresher with --force.", run
+	default:
+		return on + " (" + at + ") failed unexpectedly; check its output, then rerun the refresher.", run
+	}
 }
 func normalize(s snapshot) map[string]any {
 	groups := []map[string]any{}

@@ -1,24 +1,84 @@
 <!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="no-referrer"><title>Xiaomi Token Plan</title>
-<style>:root{color-scheme:light dark;font:16px system-ui}body{max-width:880px;margin:32px auto;padding:0 20px}h1{font-size:1.6rem}label{display:block;margin:16px 0 6px}input,button{font:inherit;padding:10px;border:1px solid #888;border-radius:5px}input{width:min(90%,440px)}button{cursor:pointer}#status{padding:12px;border:1px solid #888;border-radius:5px}section{margin:20px 0;padding:16px;border:1px solid #888;border-radius:6px}dl{display:grid;grid-template-columns:1fr 1fr;gap:10px}dd{margin:0;text-align:right}progress{width:100%}.muted{opacity:.8;font-size:.9rem}.warning{color:#b55e00}</style></head>
+<style>:root{color-scheme:light dark;font:16px system-ui}body{max-width:880px;margin:32px auto;padding:0 20px}h1{font-size:1.6rem}label{display:block;margin:16px 0 6px}input,button{font:inherit;padding:10px;border:1px solid #888;border-radius:5px}input{width:min(90%,440px)}button{cursor:pointer}#status{padding:12px;border:1px solid #888;border-radius:5px}section{margin:20px 0;padding:16px;border:1px solid #888;border-radius:6px}dl{display:grid;grid-template-columns:1fr 1fr;gap:10px}dd{margin:0;text-align:right}progress{width:100%}.muted{opacity:.8;font-size:.9rem}.warning{color:#b55e00}h3{font-size:1rem;margin:14px 0 4px}ol{margin:4px 0;padding-left:1.4rem}li{margin:6px 0}code{font:.9em ui-monospace,monospace;padding:1px 4px;border:1px solid #888;border-radius:4px;overflow-wrap:anywhere}</style></head>
 <body><h1>Xiaomi Token Plan</h1><p>Singapore · vendor Credits, not tokens or a rolling-window quota</p>
 <form id="login"><label for="key">CPA management key</label><input id="key" type="password" autocomplete="off" required aria-describedby="security"><button type="submit">Connect</button><p id="security" class="muted">Dashboard login is reused automatically when supported. Standalone or stock-panel fallback: this key stays only in page memory, never sent to Xiaomi or the collector. This plugin is trusted code served on the CPA origin.</p></form>
 <p><button id="refresh" type="button" hidden>Refresh</button> <button id="disconnect" type="button" hidden>Disconnect</button></p>
-<p id="status" role="status" aria-live="polite">Management authentication required. No quota is public.</p><div id="quota"></div><p class="muted">Auto-refresh every 60 seconds while visible. Collector polls Xiaomi every five minutes. Monthly Credits overlap plan Credits — never sum pools. Subscription expiry is not a quota reset. Reauthentication of the Xiaomi session is a separate operator action.</p>
+<p id="status" role="status" aria-live="polite">Management authentication required. No quota is public.</p><div id="help"></div><div id="quota"></div><p class="muted">Auto-refresh every 60 seconds while visible. Collector polls Xiaomi every five minutes. Monthly Credits overlap plan Credits — never sum pools. Subscription expiry is not a quota reset. Xiaomi console sessions last about 24 h; the renewal agent (if installed) replaces them automatically, and the collector reloads a replaced session within seconds. <a href="https://platform.xiaomimimo.com/#/console/plan-manage" target="_blank" rel="noopener noreferrer">Xiaomi console</a></p>
 <script>
 'use strict';
 let key='',busy=false,generation=0,controller=null,dashboard=false,dashboardReady=false,pendingBridge=null;
-const byId=id=>document.getElementById(id),status=byId('status'),quota=byId('quota');
-function clear(message){quota.replaceChildren();status.textContent=message}
+const byId=id=>document.getElementById(id),status=byId('status'),quota=byId('quota'),help=byId('help');
+const MIN=60000,H=60*MIN,REJECTED=['expired','missing','invalid_file'];
+const RESULT=new Map([['not_needed','session healthy'],['renewed','renewed the session'],['signin_required','browser not signed in to Xiaomi'],['browser_unavailable','renewal browser not running'],['vendor_unavailable','Xiaomi unreachable'],['error','failed unexpectedly']]);
+const STATE=new Map([['ok','Session OK'],['unknown','Session not checked yet'],['expired','Session rejected by Xiaomi'],['missing','Session file missing'],['invalid_file','Session file unusable']]);
+function clear(message){quota.replaceChildren();help.replaceChildren();status.className='';status.textContent=message}
 function disconnect(message='Disconnected. Management authentication required.') {generation++;controller?.abort();controller=null;busy=false;key='';dashboard=false;dashboardReady=false;byId('key').value='';byId('login').hidden=false;byId('refresh').hidden=true;byId('disconnect').hidden=true;clear(message)}
 function item(list,label,value){const dt=document.createElement('dt'),dd=document.createElement('dd');dt.textContent=label;dd.textContent=value;list.append(dt,dd)}
+function el(tag,text){const e=document.createElement(tag);if(text!==undefined)e.textContent=text;return e}
+const obj=v=>v&&typeof v==='object'&&!Array.isArray(v)?v:null;
+// Relative to this browser's clock, plus the exact UTC value from the snapshot.
+function when(iso){const ms=Date.now()-Date.parse(iso),a=Math.abs(ms),m=Math.round(a/MIN),h=Math.round(a/H);if(!Number.isFinite(ms))return String(iso);const span=m<1?'':m<60?m+' min':h<48?h+' h':Math.round(a/(24*H))+' d';return(!span?'just now':ms>0?span+' ago':'in '+span)+' ('+iso+')'}
+// none | stale (no report for 15 min) | pending (last check predates the rejection) | renewal result.
+function agentKind(r,session){if(!r)return'none';const checked=Date.parse(r.checkedAt);if(!(Date.now()-checked<=15*MIN))return'stale';if(session&&session.rejectedAt&&checked<Date.parse(session.rejectedAt))return'pending';return r.result}
+const label=r=>RESULT.get(r.result)||'unknown result';
+function summary(session,r){
+ const lines=[session?(STATE.get(session.state)||'Session state unknown')+' · session file updated '+(session.updatedAt?when(session.updatedAt):'at an unknown time')+' · Xiaomi console sessions last about 24 h.':'Session details not reported: this collector predates 0.3.0. Xiaomi console sessions last about 24 h; when one is rejected, replace the session file and restart the collector.'],k=agentKind(r,null);
+ if(k==='none'){if(session)lines.push('No renewal agent reporting. Without one, replace the session file by hand when Xiaomi rejects it (about every 24 h), or install the session refresher.')}
+ else{lines.push('Renewal agent on '+r.host+': last check '+when(r.checkedAt)+', '+label(r)+'; last renewal '+(r.renewedAt?when(r.renewedAt):'not recorded')+'.');
+  if(k==='stale')lines.push('It has not reported for over 15 min: '+r.host+' is likely asleep or its renewal timer stopped, so nothing renews the session until it runs again.');
+  else if(k==='signin_required')lines.push('Sign in at the Xiaomi console (link below) in the renewal browser on '+r.host+' before the current session expires.');
+  else if(k==='browser_unavailable')lines.push('Start the renewal browser on '+r.host+' before the current session expires.');
+  else if(k==='vendor_unavailable'||k==='error')lines.push('The agent retries on its next run; if this persists, check the session refresher on '+r.host+'.')}
+ return lines}
+function sessionGuide(s,session,r,last){
+ if(!session)return[['Xiaomi rejected the collector\'s console session, or the collector cannot read its session file. Xiaomi console sessions last about 24 h. This collector predates 0.3.0 and reports no session or renewal details.',last],['Replace the collector session file with one fresh Cookie header line from a browser signed in to the Xiaomi console (owner-only file).','Restart the collector: versions before 0.3.0 stop polling after a rejection and do not see a file replaced under a single-file mount.','Update the collector to 0.3.0 or later for automatic reload and renewal status.']];
+ const st=session.state,first=session.rejectedAt?' First noticed '+when(session.rejectedAt)+'.':'',happened=[],todo=[],k=agentKind(r,session),host=r?r.host:'',agent=r?'At its last check '+when(r.checkedAt)+', the renewal agent on '+host:'';
+ if(st==='missing')happened.push('The collector cannot find its Xiaomi session file.'+first);
+ else if(st==='invalid_file')happened.push('The collector cannot use its Xiaomi session file.'+first+' It must be a regular file (not a symlink) owned by the collector user, with owner-only permissions, holding one Cookie header line.');
+ else happened.push('Xiaomi rejected the collector\'s console session'+(session.rejectedAt?' '+when(session.rejectedAt):'')+'. Xiaomi console sessions last about 24 h; the session file was last replaced '+(session.updatedAt?when(session.updatedAt):'at an unknown time')+'.');
+ happened.push(last);
+ if(k==='none'){happened.push('No renewal agent is reporting.');todo.push('Run the session refresher from the plugin repository (refresher/refresh-session.ts) on the machine whose browser is signed in to the Xiaomi console.')}
+ else if(k==='stale'){happened.push('The renewal agent on '+host+' last reported '+when(r.checkedAt)+' — '+label(r)+'. '+host+' is likely asleep or its renewal timer stopped.');todo.push('Wake '+host+' or restart its renewal timer; its next run renews the session.')}
+ else if(k==='pending'){happened.push('The renewal agent on '+host+' last checked '+when(r.checkedAt)+', before this problem; its next run should install a new session.');todo.push('Wait for the next renewal run on '+host+', or run it now.')}
+ else if(k==='renewed'){happened.push('The renewal agent on '+host+' installed a new session '+when(r.renewedAt||r.checkedAt)+'; waiting for the collector to pick it up.');todo.push('No action needed yet: the collector reloads a replaced session file within about 15 s, without a restart.','If this persists for more than a minute, check that the collector mounts the whole session directory (not a single file) and can read the new file.')}
+ else if(k==='signin_required'){happened.push(agent+' found its browser not signed in to Xiaomi.');todo.push('On '+host+', sign in at the Xiaomi console (link below) in the renewal browser, then rerun the session refresher there.')}
+ else if(k==='browser_unavailable'){happened.push(agent+' could not reach the renewal browser; it is probably not running.');todo.push('Start the renewal browser on '+host+' (it must be signed in to the Xiaomi console), then rerun the session refresher there.')}
+ else if(k==='vendor_unavailable'){happened.push(agent+' could not reach Xiaomi to validate a new session.');todo.push('Usually transient: the agent retries on its next run. If it persists, check the internet connection of '+host+'.')}
+ else if(k==='not_needed'){happened.push(agent+' found its browser session healthy, but '+(st==='missing'?'the collector has no session file':st==='invalid_file'?'the collector cannot use its session file':'Xiaomi rejected the collector\'s copy')+'.');todo.push('Rerun the session refresher on '+host+' with --force to copy a fresh session.')}
+ else{happened.push(agent+' failed unexpectedly.');todo.push('Check the session refresher\'s output on '+host+', then rerun it.')}
+ if(r&&r.manualCommand&&k!=='renewed')todo.push([k==='not_needed'&&!/(^| )--force( |$)/.test(r.manualCommand)?'Run on '+host+', adding --force: ':'Run on '+host+': ',r.manualCommand]);
+ if(k==='none'||st==='missing'||st==='invalid_file')todo.push('Or replace the session file by hand with one Cookie header line from a browser signed in to the Xiaomi console: write it to a temporary file in the session directory, make it owner-only (mode 0600, owned by the collector user), then rename it over the session file.');
+ if(k!=='renewed')todo.push('The collector reloads a replaced session file within about 15 s, no restart needed'+(session.nextAttemptAt?'; otherwise it next contacts Xiaomi '+when(session.nextAttemptAt):'')+'.');
+ return[happened,todo]}
+// [what happened, what to do] for the first problem the snapshot shows; null when healthy.
+function guide(s,session,r){
+ const last=s.fetchedAt?'Values shown are the last known, fetched '+when(s.fetchedAt)+'.':'No quota has been fetched yet.',attempt=session&&session.lastAttemptAt?', '+when(session.lastAttemptAt):'';
+ if(s.error==='auth_required'||!s.error&&session&&REJECTED.includes(session.state))return sessionGuide(s,session,r,last);
+ if(s.error==='schema_changed')return[['On its last attempt'+attempt+', the collector received a Xiaomi console response it does not understand; the vendor API has probably changed.',last],['Check the plugin repository for an updated collector release and deploy it; a new session will not fix this.','Until then no current balance is available; the collector keeps retrying every 5 min.']];
+ if(s.error)return[['The collector could not get a usable response from Xiaomi on its last attempt'+attempt+': Xiaomi was unreachable or returned a non-authentication error.',last],['Usually transient: the collector retries every 5 min'+(session&&session.nextAttemptAt?'; next attempt '+when(session.nextAttemptAt):'')+'.','If it persists, check the collector\'s outbound internet access and whether the Xiaomi console (link below) loads.']];
+ if(s.expired)return[[s.expiresAt&&Date.parse(s.expiresAt)<=Date.now()?'The Xiaomi Token Plan subscription expired '+when(s.expiresAt)+'.':'Xiaomi reports the Token Plan subscription as expired'+(s.expiresAt?' (listed expiry '+s.expiresAt+')':'')+'.',last],['Renew the Token Plan in the Xiaomi console (link below).','The collector picks up the renewed plan on its next poll, within 5 min.']];
+ if(s.stale)return[['The collector has not completed a Xiaomi poll for more than 10 min; the last successful fetch was '+(s.fetchedAt?when(s.fetchedAt):'never')+'. A fetch time ahead of the gateway\'s clock also counts as stale.'],['Check that the collector container is running and healthy; it polls Xiaomi every 5 min.','Check that the collector and CPA clocks are in sync.']];
+ return null}
+function section(title,[happened,todo]=[[],[]]){
+ const box=el('section');box.append(el('h2',title));help.append(box);if(!happened.length)return box;
+ box.append(el('h3','What happened'));for(const line of happened)box.append(el('p',line));
+ const list=el('ol');for(const step of todo){const li=el('li');if(Array.isArray(step))li.append(el('span',step[0]),el('code',step[1]));else li.textContent=step;list.append(li)}
+ box.append(el('h3','What to do'),list);return box}
 function show(s){
- quota.replaceChildren();
- const error=s.error==='auth_required'?'Xiaomi session expired — operator reauthentication required':s.error==='schema_changed'?'Vendor response changed — operator review required':s.error?'Collector error':'';
- status.textContent=[s.accountLabel,s.planName,s.expired?'Subscription expired':s.stale?'STALE — last known values':'Fresh',error].filter(Boolean).join(' · ');
+ quota.replaceChildren();help.replaceChildren();
+ const session=obj(s.session),r=obj(s.renewal),st=session&&session.state;
+ const problem=s.error==='auth_required'?(st==='missing'?'Session file missing':st==='invalid_file'?'Session file unusable':'Xiaomi session rejected'):s.error==='schema_changed'?'Vendor response changed':s.error?'Xiaomi unreachable on last attempt':'';
+ status.textContent=[s.accountLabel,s.planName,s.expired?'Subscription expired':s.stale?'STALE — last known values':'Fresh',problem].filter(Boolean).join(' · ');
  status.className=s.stale||s.error||s.expired?'warning':'';
+ const g=guide(s,session,r),box=section('Session & renewal',g||undefined);
+ if(!g||s.error!=='auth_required'&&!REJECTED.includes(st))for(const line of summary(session,r)){const p=el('p',line);if(g)p.className='muted';box.append(p)}
  for(const pool of s.pools||[]){const card=document.createElement('section'),title=document.createElement('h2'),list=document.createElement('dl');title.textContent=pool.label;item(list,'Remaining Credits',pool.remaining);item(list,'Used Credits',pool.used);item(list,'Plan Credits',pool.limit);if(pool.remainingPercent!==null){item(list,'Remaining',pool.remainingPercent+'%');const meter=document.createElement('progress');meter.max=100;meter.value=Number(pool.remainingPercent);meter.setAttribute('aria-label',pool.label+' remaining');card.append(meter)}card.append(title,list);quota.append(card)}
  const times=document.createElement('p');times.className='muted';times.textContent='Last fetched: '+(s.fetchedAt||'Never')+' · Subscription expires: '+(s.expiresAt||'Unknown')+' · Reset: not supplied by vendor';quota.append(times)
+}
+function unavailable(){
+ clear('Quota unavailable — no current balance is being asserted.');status.className='warning';
+ section('Snapshot unavailable',[['The plugin could not return a valid snapshot from the Xiaomi quota collector, or the CPA management API did not answer. The collector may be stopped, not attached to the gateway\'s network, or sending a snapshot this plugin version rejects.'],['Check that the collector container is running and reachable from CPA at the plugin\'s collector_url.','If it is running, check that the collector and plugin versions match and review the collector logs.','This page retries every 60 s while visible; use Refresh to retry now.']])
 }
 function readDashboardSnapshot(signal){
  return new Promise((resolve,reject)=>{
@@ -46,7 +106,7 @@ async function refresh(){
  if(r.status===401||r.status===403){disconnect('Management authentication rejected. Re-enter the CPA management key.');return}
  if(!r.ok)throw Error('unavailable');s=await r.json()}
  if(session!==generation)return;if(!s||s.schemaVersion!==1||s.region!=='sgp'||!Array.isArray(s.pools))throw Error('schema');show(s)
- }catch{if(session===generation){if(dashboard&&!dashboardReady)disconnect('Automatic dashboard login unavailable. Connect with the management key to use this page standalone.');else clear('Quota unavailable. Refresh to retry; no current balance is being asserted.')}}finally{if(session===generation){busy=false;controller=null}}
+ }catch{if(session===generation){if(dashboard&&!dashboardReady)disconnect('Automatic dashboard login unavailable. Connect with the management key to use this page standalone.');else unavailable()}}finally{if(session===generation){busy=false;controller=null}}
 }
 byId('login').addEventListener('submit',e=>{e.preventDefault();key=byId('key').value.trim();byId('key').value='';if(!key)return;byId('login').hidden=true;byId('refresh').hidden=false;byId('disconnect').hidden=false;refresh()});
 byId('refresh').addEventListener('click',refresh);byId('disconnect').addEventListener('click',()=>disconnect());
