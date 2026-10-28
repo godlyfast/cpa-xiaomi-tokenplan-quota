@@ -3,7 +3,7 @@
 # The same dedicated bridge must contain exactly CPA and xiaomi-quota.
 services:
   xiaomi-quota:
-    image: cpa-xiaomi-tokenplan-quota:0.1.0
+    image: cpa-xiaomi-tokenplan-quota:0.3.0
     build:
       context: ..
       dockerfile: deploy/Dockerfile
@@ -17,11 +17,15 @@ services:
       ACCOUNT_LABEL: ${ACCOUNT_LABEL:?Set an operator-approved non-secret account label}
       ACCOUNT_REGION: sgp
       ACCOUNT_BINDING_CONFIRMED: ${ACCOUNT_BINDING_CONFIRMED:?Confirm account binding first}
-      MIMO_COOKIE_FILE: /run/secrets/mimo_session
+      # renewal-status.json beside it is read as RENEWAL_STATUS_FILE's default.
+      MIMO_COOKIE_FILE: /run/secrets/xiaomi-quota/mimo_session
     volumes:
+      # Mount the owner-only session DIRECTORY, not the file: the refresher replaces
+      # files atomically (temp + rename = new inode), which a single-file bind mount
+      # would hide until a container restart. The collector resumes on its own.
       - type: bind
-        source: ${MIMO_COOKIE_FILE:?Set a protected absolute session-file path}
-        target: /run/secrets/mimo_session
+        source: ${MIMO_SESSION_DIR:?Set a protected absolute owner-only session-directory path}
+        target: /run/secrets/xiaomi-quota
         read_only: true
     expose: ["8787"] # Not a host publication; never add ports.
     networks: [xiaomi-quota]
