@@ -1,0 +1,11 @@
+# Every 5 minutes. Calendar runs missed during suspend fire on resume; Persistent=true
+# also catches up runs missed while the user manager was not running.
+[Unit]
+Description=Check the Xiaomi MiMo collector session every 5 minutes
+
+[Timer]
+OnCalendar=*:0/5
+Persistent=true
+
+[Install]
+WantedBy=timers.target

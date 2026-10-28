@@ -1,6 +1,6 @@
 {
   "name": "cpa-xiaomi-tokenplan-quota",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "license": "MIT",
@@ -11,6 +11,7 @@
     "build": "bun build --target bun src/main.ts --outdir dist",
     "build:panel": "bun scripts/build-panel.ts",
     "build:login-panel": "bun scripts/build-panel.ts --login-bridge",
+    "refresh-session": "bun refresher/refresh-session.ts",
     "verify": "bun test && bun run type-check && bun run build"
   },
   "devDependencies": {
