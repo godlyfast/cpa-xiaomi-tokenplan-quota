@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { dirname, join } from "node:path";
-import { QuotaError } from "./mimo";
+import { QuotaError, SESSION_COOKIE } from "./mimo";
 import { readOwnedFile } from "./owned-file";
 import { readRenewalStatus } from "./renewal";
 import type {
@@ -54,10 +54,16 @@ async function readSession(path: string): Promise<SessionRead> {
     return file.reason === "missing"
       ? { kind: "missing", fingerprint: "missing", updatedAt }
       : { kind: "invalid_file", fingerprint: "invalid", updatedAt };
-  const cookie = new TextDecoder("utf-8", { ignoreBOM: true })
-    .decode(file.bytes)
-    .trim();
-  if (!cookie || cookie.length > 16384 || /[\x00-\x1f\x7f]/.test(cookie))
+  let cookie: string;
+  try {
+    cookie = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true })
+      .decode(file.bytes)
+      .trim();
+  } catch {
+    cookie = "";
+  }
+  // Strict UTF-8 that trims to printable ASCII; anything else could not be sent.
+  if (!SESSION_COOKIE.test(cookie))
     return { kind: "invalid_file", fingerprint: "invalid", updatedAt };
   // The content hash also catches same-inode rewrites within mtime granularity.
   // Fingerprints stay in memory only.
@@ -257,8 +263,11 @@ export function createCollector(options: CollectorOptions): {
           updatedAt,
           rejectedAt: isBlocked ? rejectedAt : null,
           lastAttemptAt: isoOrNull(lastAttempt),
+          // A missing or unusable file is never sent; only a file change triggers a fetch.
           nextAttemptAt:
-            lastAttempt === null
+            lastAttempt === null ||
+            state === "missing" ||
+            state === "invalid_file"
               ? null
               : isoOrNull(lastAttempt + (isBlocked ? retryMs : pollMs)),
         },

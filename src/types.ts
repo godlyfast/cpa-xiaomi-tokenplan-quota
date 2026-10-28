@@ -41,6 +41,7 @@ export type RenewalResult =
   | "signin_required"
   | "browser_unavailable"
   | "vendor_unavailable"
+  | "account_mismatch"
   | "error";
 // renewal-status.json schema v1 without schemaVersion.
 export interface RenewalStatus {

@@ -3,7 +3,8 @@ import { HOST_RE, statusJson, type RenewalResult } from "../refresher/lib";
 import { parseRenewalStatus } from "../src/renewal";
 
 // Cross-component contract: everything the refresher writes must pass the collector's strict reader.
-const results: RenewalResult[] = ["not_needed", "renewed", "signin_required", "browser_unavailable", "vendor_unavailable", "error"];
+// The union keeps this compiling whether or not refresher/lib.ts lists account_mismatch yet.
+const results: (RenewalResult | "account_mismatch")[] = ["not_needed", "renewed", "signin_required", "browser_unavailable", "vendor_unavailable", "account_mismatch", "error"];
 const configs = [
   { hostLabel: "archlinux", manualCommand: "systemctl --user start xiaomi-session-refresh.service" },
   { hostLabel: "h".repeat(64), manualCommand: "~".repeat(160) },
@@ -16,7 +17,7 @@ test("every refresher status is accepted verbatim by the collector parser", () =
     for (const result of results)
       for (const renewedAt of [null, "2026-10-28T19:13:39.255Z"]) {
         // The remote writer appends a newline; the collector reads the file as written.
-        const parsed = parseRenewalStatus(statusJson(cfg, result, now, renewedAt) + "\n");
+        const parsed = parseRenewalStatus(statusJson(cfg, result as RenewalResult, now, renewedAt) + "\n");
         expect(parsed).toEqual({ checkedAt: now.toISOString(), result, renewedAt, host: cfg.hostLabel, manualCommand: cfg.manualCommand });
       }
 });
