@@ -1,7 +1,15 @@
-import { open } from "node:fs/promises";
-import { constants } from "node:fs";
+import { createHash } from "node:crypto";
+import { dirname, join } from "node:path";
 import { QuotaError } from "./mimo";
-import type { QuotaSnapshot, QuotaErrorCode } from "./types";
+import { readOwnedFile } from "./owned-file";
+import { readRenewalStatus } from "./renewal";
+import type {
+  CollectorSnapshot,
+  QuotaErrorCode,
+  QuotaSnapshot,
+  RenewalStatus,
+  SessionState,
+} from "./types";
 
 export interface CollectorOptions {
   cookieFile: string;
@@ -13,35 +21,67 @@ export interface CollectorOptions {
   ) => Promise<QuotaSnapshot>;
   now?: () => Date;
   pollIntervalMs?: number;
+  // While blocked, how often to look for a replaced session file.
+  sessionCheckIntervalMs?: number;
+  // Minimum spacing between retries of an unchanged rejected session.
+  authRetryIntervalMs?: number;
+  // Defaults to renewal-status.json beside cookieFile.
+  renewalStatusFile?: string;
+  // One line per session-state transition; never secrets, bodies or error text.
+  log?: (line: string) => void;
 }
-async function readCookie(path: string): Promise<string> {
-  // Open first with O_NOFOLLOW; fstat the same descriptor to avoid symlink/permission races.
-  const file = await open(
-    path,
-    constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
-  );
-  try {
-    const stat = await file.stat();
-    if (
-      !stat.isFile() ||
-      (stat.mode & 0o077) !== 0 ||
-      stat.uid !== process.getuid?.() ||
-      stat.size > 16385
-    )
-      throw new Error("Invalid secret");
-    const cookie = (await file.readFile("utf8")).trim();
-    if (!cookie || cookie.length > 16384 || /[\x00-\x1f\x7f]/.test(cookie))
-      throw new Error("Invalid secret");
-    return cookie;
-  } finally {
-    await file.close();
-  }
+// Canonical Date#toISOString() form only, so consumers can parse strictly.
+const ISO_UTC = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/;
+function isoOrNull(ms: number | null): string | null {
+  if (ms === null || !Number.isFinite(ms)) return null;
+  const date = new Date(ms);
+  if (!Number.isFinite(date.getTime())) return null;
+  const iso = date.toISOString();
+  return ISO_UTC.test(iso) ? iso : null;
+}
+type SessionRead =
+  | { kind: "ok"; cookie: string; fingerprint: string; updatedAt: string | null }
+  | {
+      kind: "missing" | "invalid_file";
+      fingerprint: "missing" | "invalid";
+      updatedAt: string | null;
+    };
+// Never throws. mtime is reported only for an observed regular file.
+async function readSession(path: string): Promise<SessionRead> {
+  const file = await readOwnedFile(path, 16385, 0o077);
+  const updatedAt = file.stat?.isFile() ? isoOrNull(file.stat.mtimeMs) : null;
+  if (!file.ok)
+    return file.reason === "missing"
+      ? { kind: "missing", fingerprint: "missing", updatedAt }
+      : { kind: "invalid_file", fingerprint: "invalid", updatedAt };
+  const cookie = new TextDecoder("utf-8", { ignoreBOM: true })
+    .decode(file.bytes)
+    .trim();
+  if (!cookie || cookie.length > 16384 || /[\x00-\x1f\x7f]/.test(cookie))
+    return { kind: "invalid_file", fingerprint: "invalid", updatedAt };
+  // The content hash also catches same-inode rewrites within mtime granularity.
+  // Fingerprints stay in memory only.
+  const { dev, ino, size, mtimeMs } = file.stat;
+  const digest = createHash("sha256").update(cookie).digest("hex");
+  return {
+    kind: "ok",
+    cookie,
+    fingerprint: `${dev}:${ino}:${size}:${mtimeMs}:${digest}`,
+    updatedAt,
+  };
 }
 export function createCollector(options: CollectorOptions): {
   fetch(request: Request): Promise<Response>;
   close(): Promise<void>;
 } {
   const now = options.now ?? (() => new Date());
+  const log = options.log ?? ((line: string) => console.error(line));
+  const pollMs = options.pollIntervalMs ?? 300000,
+    checkMs = options.sessionCheckIntervalMs ?? 15000,
+    retryMs = options.authRetryIntervalMs ?? 3600000;
+  const renewalFile =
+    options.renewalStatusFile ??
+    join(dirname(options.cookieFile), "renewal-status.json");
   let snapshot: QuotaSnapshot = {
     schemaVersion: 1,
     region: "sgp",
@@ -55,31 +95,88 @@ export function createCollector(options: CollectorOptions): {
     stale: true,
     error: "unavailable",
   };
+  let state: SessionState = "unknown",
+    updatedAt: string | null = null,
+    rejectedAt: string | null = null,
+    // Fingerprint the blocking verdict applies to (the content sent, or a file sentinel).
+    blockedFingerprint: string | null = null,
+    lastAttempt: number | null = null,
+    renewal: RenewalStatus | null = null;
   let closed = false,
-    halted = false,
-    pending: Promise<void> | null = null;
+    pending: Promise<void> | null = null,
+    checking: Promise<void> | null = null;
   const controller = new AbortController();
+  const blocked = () =>
+    state === "expired" || state === "missing" || state === "invalid_file";
+  function enter(next: SessionState) {
+    if (next === state) return;
+    try {
+      log(`session state ${state} -> ${next}`);
+    } catch {}
+    state = next;
+  }
+  function block(next: SessionState, fingerprint: string) {
+    // rejectedAt marks the FIRST rejection of this exact session content.
+    if (!blocked() || blockedFingerprint !== fingerprint || rejectedAt === null)
+      rejectedAt = isoOrNull(now().getTime());
+    blockedFingerprint = fingerprint;
+    enter(next);
+  }
+  function unblock(next: SessionState) {
+    rejectedAt = blockedFingerprint = null;
+    enter(next);
+  }
   async function refresh() {
-    if (closed || halted || pending) return;
+    if (closed || pending) return;
     pending = (async () => {
       try {
-        let cookie: string;
-        try {
-          cookie = await readCookie(options.cookieFile);
-        } catch {
-          throw new QuotaError("auth_required");
+        const read = await readSession(options.cookieFile);
+        if (closed) return;
+        updatedAt = read.updatedAt;
+        if (read.kind !== "ok") {
+          // A missing or invalid file never reaches Xiaomi.
+          block(read.kind, read.fingerprint);
+          snapshot = { ...snapshot, stale: true, error: "auth_required" };
+        } else {
+          const started = now();
+          lastAttempt = started.getTime();
+          let next: QuotaSnapshot | null = null,
+            code: QuotaErrorCode = "unavailable";
+          try {
+            next = await options.fetchSnapshot(
+              read.cookie,
+              started,
+              controller.signal,
+            );
+          } catch (error) {
+            if (error instanceof QuotaError) code = error.code;
+          }
+          if (closed) return;
+          if (next) {
+            snapshot = next;
+            unblock("ok");
+          } else {
+            if (code === "auth_required") block("expired", read.fingerprint);
+            // Non-auth failures keep the verdict, unless it was about a session
+            // that has since been replaced: that one is unverified, not rejected.
+            else if (blocked() && blockedFingerprint !== read.fingerprint)
+              unblock("unknown");
+            snapshot = {
+              ...snapshot,
+              stale: true,
+              error: blocked() ? "auth_required" : code,
+            };
+          }
         }
-        const next = await options.fetchSnapshot(
-          cookie,
-          now(),
-          controller.signal,
-        );
-        if (!closed) snapshot = next;
-      } catch (error) {
-        const code: QuotaErrorCode =
-          error instanceof QuotaError ? error.code : "unavailable";
-        if (code === "auth_required") halted = true;
-        if (!closed) snapshot = { ...snapshot, stale: true, error: code };
+        const status = await readRenewalStatus(renewalFile);
+        if (!closed) renewal = status;
+      } catch {
+        if (!closed)
+          snapshot = {
+            ...snapshot,
+            stale: true,
+            error: blocked() ? "auth_required" : "unavailable",
+          };
       }
     })();
     try {
@@ -88,10 +185,48 @@ export function createCollector(options: CollectorOptions): {
       pending = null;
     }
   }
-  const initial = refresh();
-  const timer = setInterval(() => {
+  // Session-check tick: renewal status always; the session file only while blocked.
+  async function check() {
+    if (closed || pending || checking) return;
+    let changed = false;
+    checking = (async () => {
+      try {
+        if (blocked()) {
+          const read = await readSession(options.cookieFile);
+          if (closed || pending) return;
+          updatedAt = read.updatedAt;
+          changed = read.fingerprint !== blockedFingerprint;
+        }
+        const status = await readRenewalStatus(renewalFile);
+        if (!closed) renewal = status;
+      } catch {}
+    })();
+    try {
+      await checking;
+    } finally {
+      checking = null;
+    }
+    if (changed) await refresh();
+  }
+  function poll() {
+    if (closed) return;
+    const elapsed =
+      lastAttempt === null ? Infinity : now().getTime() - lastAttempt;
+    // An unchanged rejected session waits for retryMs; replacements go through check().
+    if (blocked() && elapsed >= 0 && elapsed < retryMs) return;
     void refresh();
-  }, options.pollIntervalMs ?? 300000);
+  }
+  const initial = refresh();
+  const timers = [
+    setInterval(() => {
+      try {
+        poll();
+      } catch {}
+    }, pollMs),
+    setInterval(() => {
+      check().catch(() => {});
+    }, checkMs),
+  ];
   return {
     async fetch(request) {
       const url = new URL(request.url);
@@ -113,16 +248,29 @@ export function createCollector(options: CollectorOptions): {
         snapshot.fetchedAt === null
           ? Infinity
           : now().getTime() - Date.parse(snapshot.fetchedAt);
-      return Response.json(
-        { ...snapshot, stale: snapshot.stale || age > 600000 || age < 0 },
-        { headers },
-      );
+      const isBlocked = blocked();
+      const body: CollectorSnapshot = {
+        ...snapshot,
+        stale: snapshot.stale || age > 600000 || age < 0,
+        session: {
+          state,
+          updatedAt,
+          rejectedAt: isBlocked ? rejectedAt : null,
+          lastAttemptAt: isoOrNull(lastAttempt),
+          nextAttemptAt:
+            lastAttempt === null
+              ? null
+              : isoOrNull(lastAttempt + (isBlocked ? retryMs : pollMs)),
+        },
+        renewal,
+      };
+      return Response.json(body, { headers });
     },
     async close() {
       closed = true;
-      clearInterval(timer);
+      for (const timer of timers) clearInterval(timer);
       controller.abort();
-      await pending;
+      await Promise.all([pending, checking]);
     },
   };
 }
