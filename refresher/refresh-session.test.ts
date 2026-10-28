@@ -26,7 +26,7 @@ const HEADER =
   "api-platform_serviceToken=SYNTHETIC-svc-token-aaaa; api-platform_slh=SYNTHETIC-slh-bbbb; " +
   "api-platform_ph=SYNTHETIC-ph-cccc; userId=SYNTHETIC-uid-0000";
 const ENV = {
-  XQ_SSH_TARGET: "tim@collector.example",
+  XQ_SSH_TARGET: "user@collector.example",
   XQ_REMOTE_DIR: "/srv/xiaomi-quota/session",
   XQ_COLLECTOR_CONTAINER: "xiaomi-quota",
   XQ_MANUAL_COMMAND: "systemctl --user start xiaomi-session-refresh.service",
@@ -365,7 +365,7 @@ async function run(
 test("config: defaults, loopback CDP forms and hostname-derived label", () => {
   expect(cfg).toEqual({
     cdpOrigin: "http://127.0.0.1:9223",
-    sshTarget: "tim@collector.example",
+    sshTarget: "user@collector.example",
     remoteDir: "/srv/xiaomi-quota/session",
     container: "xiaomi-quota",
     hostLabel: "laptop",
@@ -391,7 +391,7 @@ test("config: defaults, loopback CDP forms and hostname-derived label", () => {
 test("config: rejects non-loopback CDP and injection attempts without echoing them", () => {
   const bad: Record<string, string[]> = {
     XQ_CDP_URL: [
-      "http://192.168.55.100:9223",
+      "http://192.0.2.10:9223",
       "http://127.0.0.1.evil.example:9223",
       "http://localhost.:9223",
       "https://127.0.0.1:9223",
@@ -405,13 +405,13 @@ test("config: rejects non-loopback CDP and injection attempts without echoing th
       "",
       "collector.example",
       "-oProxyCommand=sh@x",
-      "tim@-oProxyCommand",
-      "tim@host;id",
-      "tim@host id",
+      "user@-oProxyCommand",
+      "user@host;id",
+      "user@host id",
       "$(id)@host",
-      "tim@host\nid",
+      "user@host\nid",
       "@host",
-      "tim@",
+      "user@",
     ],
     XQ_REMOTE_DIR: [
       "",
@@ -491,9 +491,9 @@ test("remote commands: single-quoted words survive a POSIX login shell exactly",
     for (const mode of ["push", "rebind", "status"] as const)
       expect(() => lib.writeCommand(dir, mode)).toThrow(lib.ConfigError);
   expect(() => lib.sshArgv("-oProxyCommand=x@h", "true")).toThrow(lib.ConfigError);
-  expect(lib.sshArgv("tim@collector.example", "true").slice(-3)).toEqual([
+  expect(lib.sshArgv("user@collector.example", "true").slice(-3)).toEqual([
     "--",
-    "tim@collector.example",
+    "user@collector.example",
     "true",
   ]);
 });
@@ -584,7 +584,7 @@ test("spawn runner: cookie travels only on stdin; env is minimal; timeout kills"
         PATH: process.env.PATH,
         HOME: dir,
         SSH_AUTH_SOCK: "/synthetic/agent.sock",
-        XQ_SSH_TARGET: "tim@collector.example",
+        XQ_SSH_TARGET: "user@collector.example",
         UNRELATED_SECRET: "SYNTHETIC-do-not-pass",
       },
     });
@@ -1170,8 +1170,8 @@ test("entrypoint refuses invalid configuration before any I/O", async () => {
   try {
     for (const [args, env, message] of [
       [["--bogus"], ENV, "usage:"],
-      [[], { ...ENV, XQ_SSH_TARGET: "tim@host;id" }, "XQ_SSH_TARGET"],
-      [[], { ...ENV, XQ_CDP_URL: "http://192.168.55.100:9223" }, "XQ_CDP_URL"],
+      [[], { ...ENV, XQ_SSH_TARGET: "user@host;id" }, "XQ_SSH_TARGET"],
+      [[], { ...ENV, XQ_CDP_URL: "http://192.0.2.10:9223" }, "XQ_CDP_URL"],
       [["--check"], { XQ_REMOTE_DIR: "/srv/x" }, "XQ_SSH_TARGET"],
     ] as const) {
       const p = Bun.spawn([process.execPath, join(import.meta.dir, "refresh-session.ts"), ...args], {
