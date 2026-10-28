@@ -1,0 +1,20 @@
+# Example user unit. Install a copy of the refresher directory, edit the
+# placeholders, then: systemctl --user daemon-reload &&
+# systemctl --user enable --now xiaomi-session-refresh.timer
+# ssh runs with BatchMode=yes: key auth only, known_hosts already trusted, and
+# an unencrypted key or an SSH_AUTH_SOCK agent visible to the user manager.
+[Unit]
+Description=Renew the Xiaomi MiMo collector session from the signed-in renewal browser
+
+[Service]
+Type=oneshot
+TimeoutStartSec=120
+Environment=PATH=%h/.bun/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=XQ_CDP_URL=http://127.0.0.1:9223
+Environment=XQ_SSH_TARGET=user@collector-host.example
+Environment=XQ_REMOTE_DIR=/srv/xiaomi-quota/session
+Environment=XQ_COLLECTOR_CONTAINER=xiaomi-quota
+Environment="XQ_MANUAL_COMMAND=systemctl --user start xiaomi-session-refresh.service"
+#Environment=XQ_HOST_LABEL=workstation
+ExecStart=/usr/bin/env bun %h/.local/share/xiaomi-session-refresh/refresh-session.ts
+NoNewPrivileges=yes
