@@ -138,7 +138,7 @@ test("healthy session warns early when the renewal agent cannot renew", async ()
   for (const want of ["cannot reach the collector or write its status", "run the refresher with --check on synthetic-host and read its unit journal"]) expect(p.help).toContain(want);
   expect(p.help).not.toContain("until it runs again");
   p = await render(v3({ renewal: agent("account_mismatch") }));
-  for (const want of ["last check 2 min ago (", "renewal refused: browser signed in to a different Xiaomi account; last renewal", "different Xiaomi account than the collector's current session", "no account id", "--rebind", "before the current session expires"]) expect(p.help).toContain(want);
+  for (const want of ["last check 2 min ago (", "renewal refused: installed session is missing, unusable or of another Xiaomi account; last renewal", "different Xiaomi account than the collector's current session", "no account id", "--rebind", "before the current session expires"]) expect(p.help).toContain(want);
   p = await render(v3({ renewal: agent("signin_required") }));
   expect(p.help).toContain("Sign in at the Xiaomi console"); expect(p.help).toContain("synthetic-host before the current session expires");
   p = await render(v3({ renewal: agent("browser_unavailable") }));
@@ -197,6 +197,13 @@ test("missing and unusable session files explain the file requirements", async (
   p = await render(rejected(null, "invalid_file"));
   expect(p.status).toContain("Session file unusable");
   expect(p.help).toContain("cannot use its Xiaomi session file"); expect(p.help).toContain("not a symlink"); expect(p.help).toContain("one Cookie header line of printable ASCII");
+  // account_mismatch with no comparable file: blame the file, not the browser account.
+  for (const state of ["missing", "invalid_file"]) {
+    p = await render(rejected(agent("account_mismatch"), state));
+    expect(p.help).toContain("cannot compare Xiaomi accounts with a session file that is missing or unusable");
+    expect(p.help).toContain("rerun the refresher there once with --rebind (no account label change needed)");
+    expect(p.help).not.toContain("signed in to a different Xiaomi account than");
+  }
 });
 test("older collectors without session details get generic restart guidance", async () => {
   const { session: _s, renewal: _r, ...old } = rejected(null);

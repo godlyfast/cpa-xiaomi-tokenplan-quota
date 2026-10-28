@@ -156,7 +156,7 @@ plugins:
                 assert status == 200 and data['session']['nextAttemptAt'] is None and data['renewal']['result'] == 'account_mismatch', (status, data)
                 status, body, _ = request('/v0/management/quota/fetch', {'auth_index': index})
                 text = json.loads(body)['error']
-                for want in ('session file is missing', 'different Xiaomi account', 'no account id', '--rebind', 'Details: Plugins'):
+                for want in ('session file is missing', 'cannot compare accounts with a missing or unusable session file', '--rebind', 'Details: Plugins'):
                     assert status == 502 and want in text, (want, status, text)
                 assert len(text.encode()) <= 400 + len('failed to fetch quota: '), text
                 # Invalid renewal data fails closed for the whole snapshot.

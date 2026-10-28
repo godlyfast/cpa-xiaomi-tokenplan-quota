@@ -397,7 +397,7 @@ const resumes = "The collector resumes within seconds of a new session file."
 func renewalAdvice(v *sessionInfo, r *renewalInfo, now time.Time) ([]string, []string) {
 	if r == nil {
 		// A pre-0.3.0 single-file bind keeps the old inode and never shows the status file, so it always lands here.
-		return []string{"No renewal agent reports: run refresher/refresh-session.ts where a browser is signed in to the Xiaomi console, or replace the session file.", "The collector resumes within seconds of a new file; a pre-0.3.0 single-file mount needs a restart or the directory mount."}, nil
+		return []string{"No renewal agent reports: run refresher/refresh-session.ts or replace the session file (single-file pre-0.3.0 mounts: restart the collector)."}, nil
 	}
 	checked, _ := time.Parse(time.RFC3339Nano, r.CheckedAt)
 	on, at, run := "Renewal agent on "+r.Host, utc(r.CheckedAt), ""
@@ -426,6 +426,10 @@ func renewalAdvice(v *sessionInfo, r *renewalInfo, now time.Time) ([]string, []s
 	case "vendor_unavailable":
 		return []string{on + " (" + at + ") could not reach Xiaomi; it retries on its next run."}, []string{run, resumes}
 	case "account_mismatch":
+		if v.State == "missing" || v.State == "invalid_file" {
+			// Nothing to compare against: the refresher never replaces such a file without --rebind.
+			return []string{on + " refused: it cannot compare accounts with a missing or unusable session file.", "With the browser signed in to the bound account, rerun it once with --rebind."}, []string{run, resumes}
+		}
 		return []string{on + " refused: its browser is signed in to a different Xiaomi account than the collector session, or that has no account id.", "Sign that browser into the bound account and rerun, or use --rebind and update the collector's account label."}, []string{run, resumes}
 	case "not_needed":
 		return []string{on + " (" + at + ") saw no session rejection; its next run should renew."}, []string{run, resumes}

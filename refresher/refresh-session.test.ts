@@ -195,6 +195,9 @@ interface Script {
   hang?: string;
   evaluate?: Record<string, unknown>;
   evaluateErrors?: number;
+  // Answers this command late (after ms), like a slow browser.
+  delay?: { method: string; ms: number };
+  onCookies?: () => void;
 }
 class FakeCdp implements lib.CdpClient {
   sent: { method: string; params: Record<string, unknown>; sessionId?: string }[] = [];
@@ -219,6 +222,7 @@ class FakeCdp implements lib.CdpClient {
       await Bun.sleep(ms ?? 60000);
       throw new lib.CdpError();
     }
+    if (this.script.delay?.method === method) await Bun.sleep(this.script.delay.ms);
     switch (method) {
       case "Target.createTarget":
         return { targetId: "T-OWNED" };
@@ -237,6 +241,7 @@ class FakeCdp implements lib.CdpClient {
         }
         return this.script.evaluate ?? { result: { type: "boolean", value: this.ready } };
       case "Network.getCookies":
+        this.script.onCookies?.();
         return { cookies: this.script.cookies ?? jar() };
     }
     throw new Error("unexpected method");
@@ -1310,7 +1315,7 @@ test("account binding end to end: same account renews, other account is account_
     expect(await readFile(file, "utf8")).toBe(HEADER + "\n");
     expect((await statusFile()).result).toBe("renewed");
     const mismatch =
-      "xiaomi-session-refresh: account_mismatch (browser account does not match the installed session; collector auth_required since " +
+      "xiaomi-session-refresh: account_mismatch (installed session missing, unusable or of another account; collector auth_required since " +
       REJECTED +
       ")";
     for (const current of [OTHER + "\n", "api-platform_serviceToken=SYNTHETIC-other-svc\n", null]) {
@@ -1477,6 +1482,26 @@ test("abort (SIGTERM/SIGINT) closes the owned tab at once and writes nothing", a
   });
   expect(r.out).toEqual({ code: 1, line });
   expect(r.ssh.calls.map((x) => x.kind)).toEqual(["read"]);
+  // getCookies answers after the interrupt: the copied session is never sent to Xiaomi.
+  ac = new AbortController();
+  r = await run({ signal: ac.signal, cdp: new FakeCdp({ onCookies: () => ac.abort() }) });
+  expect(r.out).toEqual({ code: 1, line });
+  expect(r.fetcher.calls).toEqual([]);
+  expect(r.ssh.calls.map((x) => x.kind)).toEqual(["read"]);
+  // Interrupted during the first validation request: the second one never starts.
+  ac = new AbortController();
+  r = await run({ signal: ac.signal, fetch: fakeFetch({ usage: () => { ac.abort(); return Response.json({ code: 0, data: {} }); } }) });
+  expect(r.out).toEqual({ code: 1, line });
+  expect(r.fetcher.calls.map((c) => new URL(c.url).pathname)).toEqual(["/api/v1/tokenPlan/usage"]);
+  // createTarget answers after the interrupt: the late tab is still closed.
+  ac = new AbortController();
+  const late = new FakeCdp({ delay: { method: "Target.createTarget", ms: 60 } });
+  const lateRun = run({ signal: ac.signal, cdp: late });
+  while (!late.sent.some((x) => x.method === "Target.createTarget")) await Bun.sleep(2);
+  ac.abort();
+  r = await lateRun;
+  expect(r.out).toEqual({ code: 1, line });
+  expect(late.sent.filter((x) => x.method === "Target.closeTarget").map((x) => x.params.targetId)).toEqual(["T-OWNED"]);
   // Already aborted: no browser at all.
   ac = new AbortController();
   ac.abort();

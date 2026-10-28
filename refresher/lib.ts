@@ -780,9 +780,13 @@ export async function validateSession(
   header: string,
   fetcher: Fetcher,
   timeoutMs: number,
+  interrupt?: AbortSignal,
 ): Promise<"ok" | "signin_required" | "vendor_unavailable"> {
-  const signal = AbortSignal.timeout(timeoutMs);
+  const timeout = AbortSignal.timeout(timeoutMs);
+  const signal = interrupt ? AbortSignal.any([timeout, interrupt]) : timeout;
   for (const path of ["usage", "detail"]) {
+    // Never start a cookie-bearing request after SIGTERM/SIGINT.
+    if (interrupt?.aborted) return "vendor_unavailable";
     try {
       const response = await fetcher(ORIGIN + "/api/v1/tokenPlan/" + path, {
         method: "GET",
@@ -879,7 +883,7 @@ const REMOTE_EXIT: Record<number, string> = {
   3: "remote session directory missing",
   4: "remote session directory not owned by ssh user",
   5: "remote session directory is group/world accessible",
-  8: "installed session belongs to another account",
+  8: "installed session missing, unusable or of another account",
   255: "ssh failed",
 };
 const exitCode = (r: RenewalResult): 0 | 1 | 2 | 3 =>
@@ -984,8 +988,9 @@ export async function runRefresh(
       client.close();
     }
     if ("result" in outcome) return fail(outcome.result, outcome.reason);
-    if (run.expired()) return fail("error", DEADLINE);
-    const valid = await validateSession(outcome.header, deps.fetch, run.budget(t.vendorMs));
+    const pre = stopped(run);
+    if (pre) return fail("error", pre);
+    const valid = await validateSession(outcome.header, deps.fetch, run.budget(t.vendorMs), run.signal);
     const stop = stopped(run);
     if (stop) return fail("error", stop);
     if (valid === "signin_required")
@@ -995,7 +1000,7 @@ export async function runRefresh(
     const now = deps.now();
     const code = await write("renewed", now.toISOString(), now, outcome.header, run.budget(t.writeSshMs));
     if (code === 8)
-      return fail("account_mismatch", "browser account does not match the installed session");
+      return fail("account_mismatch", "installed session missing, unusable or of another account");
     if (code !== 0) return fail("error", "session push failed: " + why(code));
     return { code: 0, line: PREFIX + "renewed (" + context + ")" };
   } catch {

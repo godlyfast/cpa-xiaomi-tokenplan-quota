@@ -26,7 +26,9 @@ try {
   process.exit(1);
 }
 // SIGTERM (unit stop or start timeout) and SIGINT: the run closes its owned tab
-// (bounded by its 2 s close timeout) and writes nothing more; exit 128+signal.
+// and writes nothing more; exit 128+signal. The fallback exit waits out one
+// pending DevTools command (10 s) plus the tab close (2 s), so a tab whose
+// createTarget reply arrives after the signal is still closed.
 const interrupt = new AbortController();
 let signalled = 0;
 const finish = (code: number): never => {
@@ -41,7 +43,7 @@ for (const [name, code] of [
     if (signalled) return;
     signalled = code;
     interrupt.abort();
-    setTimeout(() => finish(code), 3000);
+    setTimeout(() => finish(code), 13000);
   });
 const outcome = await runRefresh(config, flags, {
   ssh: spawnRunner(),

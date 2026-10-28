@@ -1,6 +1,7 @@
 # Example user unit. Install a copy of the refresher directory, edit the
-# placeholders, then: systemctl --user daemon-reload &&
-# systemctl --user enable --now xiaomi-session-refresh.timer
+# placeholders, run the end-to-end smoke test in docs/session-renewal.md
+# (Installation) with these same XQ_* values, then:
+# systemctl --user daemon-reload && systemctl --user enable --now xiaomi-session-refresh.timer
 # ssh runs with BatchMode=yes: key auth only, known_hosts already trusted, and
 # an unencrypted key or an SSH_AUTH_SOCK agent visible to the user manager.
 # The timer never passes --rebind, so a renewal only replaces a session of the
@@ -9,7 +10,7 @@
 # account switch need one manual run with this environment plus --rebind
 # (add --force if the collector is healthy); then update ACCOUNT_LABEL.
 # The run stops itself after 100 s, closes its tab and writes its status
-# (at most ~125 s in total); SIGTERM closes the tab before exiting.
+# (about 122 s in total); SIGTERM closes the tab before exiting.
 [Unit]
 Description=Renew the Xiaomi MiMo collector session from the signed-in renewal browser
 

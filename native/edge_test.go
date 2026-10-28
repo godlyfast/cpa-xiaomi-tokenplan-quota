@@ -77,7 +77,7 @@ func TestQuotaFetchFailuresAreSpecificAndActionable(t *testing.T) {
 		later      time.Duration
 		want, not  []string
 	}{
-		{"expired-no-agent", edit(t, auth, map[string]any{"session": expired}), 0, []string{"rejected the collector session at 2026-10-27T11:00:00Z", "sessions have lasted ~24 h", "refresher/refresh-session.ts", "signed in to the Xiaomi console", "resumes within seconds of a new file", "a pre-0.3.0 single-file mount needs a restart or the directory mount"}, []string{"lifetime", "then restart"}},
+		{"expired-no-agent", edit(t, auth, map[string]any{"session": expired}), 0, []string{"rejected the collector session at 2026-10-27T11:00:00Z", "sessions have lasted ~24 h", "refresher/refresh-session.ts", "single-file pre-0.3.0 mounts: restart the collector"}, []string{"lifetime", "then restart"}},
 		{"expired-signin", edit(t, auth, agent("signin_required", "2026-10-27T11:58:00.000Z")), 0, []string{"Renewal agent on synthetic-host", "11:58:00Z", "not signed in", "sign in at the Xiaomi console", "Run on synthetic-host: `bun refresher/refresh-session.ts`."}, nil},
 		{"expired-renewed", edit(t, auth, map[string]any{"session": expired, "renewal": with(renewalBlock("renewed", "2026-10-27T11:58:00.000Z", "bun refresher/refresh-session.ts"), "renewedAt", "2026-10-27T11:57:59.000Z")}), 0, []string{"installed a new session at 2026-10-27T11:57:59Z", "waiting for the collector"}, []string{"Run on"}},
 		{"expired-browser", edit(t, auth, agent("browser_unavailable", "2026-10-27T11:58:00.000Z")), 0, []string{"renewal browser is not running", "start it"}, nil},
@@ -149,7 +149,8 @@ func TestQuotaFetchMessageStaysBoundedForLongestValidFields(t *testing.T) {
 		want                     []string
 	}{
 		"stale":            {"invalid_file", "account_mismatch", "2026-10-27T10:00:00.000Z", []string{"cannot reach the collector or write its status", "--check", "unit journal"}},
-		"account-mismatch": {"missing", "account_mismatch", "2026-10-27T11:58:00.000Z", []string{"different Xiaomi account", "no account id"}},
+		"account-mismatch": {"expired", "account_mismatch", "2026-10-27T11:58:00.000Z", []string{"different Xiaomi account", "no account id"}},
+		"mismatch-no-file": {"missing", "account_mismatch", "2026-10-27T11:58:00.000Z", []string{"cannot compare accounts with a missing or unusable session file", "--rebind"}},
 		"not-needed":       {"invalid_file", "not_needed", "2026-10-27T11:58:00.000Z", []string{"saw no session rejection"}},
 	} {
 		r := renewalBlock(test.result, test.checkedAt, strings.Repeat("x", 160))
@@ -162,7 +163,7 @@ func TestQuotaFetchMessageStaysBoundedForLongestValidFields(t *testing.T) {
 		}
 	}
 	m = fetchFailure(t, testPlugin(t, edit(t, fixture, map[string]any{"stale": true, "error": "auth_required", "session": sessionBlock("invalid_file", "2026-10-27T11:00:00.000Z")})))
-	for _, want := range []string{"cannot use its Xiaomi session file", "printable-ASCII Cookie header line", "No renewal agent reports"} {
+	for _, want := range []string{"cannot use its Xiaomi session file", "printable-ASCII Cookie header line", "No renewal agent reports", "single-file pre-0.3.0 mounts: restart the collector"} {
 		if !strings.Contains(m, want) {
 			t.Errorf("no-agent: dropped %q: %s", want, m)
 		}
