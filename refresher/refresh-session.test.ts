@@ -2819,7 +2819,7 @@ test("units: TimeoutStartSec covers the deadline and every bounded step after it
     expect(Number.isInteger(seconds)).toBe(true);
     // Margin for start-up, the lock and the state write.
     expect(seconds * 1000 - lib.worstCaseMs(d)).toBeGreaterThanOrEqual(15000);
-    for (const line of ["Type=oneshot", "StateDirectory=xiaomi-session-refresh", "StateDirectoryMode=0700", "NoNewPrivileges=yes"])
+    for (const line of ["Type=oneshot", "StateDirectory=xiaomi-session-refresh-state", "StateDirectoryMode=0700", "NoNewPrivileges=yes"])
       expect({ name, lines }).toEqual({ name, lines: expect.arrayContaining([line]) });
     expect(lines.find((l) => l.startsWith("ExecStart="))).not.toMatch(/--rebind|--force/);
   }
@@ -2895,7 +2895,7 @@ test("entrypoint: under the shipped units a timer run backs off, the manual comm
     await writeFile(join(bin, "ssh"), `#!/bin/sh\ncat > /dev/null\nprintf '%s\\n' '${collector("auth_required")}'\n`, {
       mode: 0o700,
     });
-    // What StateDirectory=xiaomi-session-refresh provides: the directory and STATE_DIRECTORY.
+    // What StateDirectory=xiaomi-session-refresh-state provides: the directory and STATE_DIRECTORY.
     const state = join(home, ".local", "state", "xiaomi-session-refresh");
     await mkdir(state, { recursive: true, mode: 0o700 });
     // Two sign-in failures, the last a minute ago, against the same collector session.

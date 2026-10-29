@@ -13,11 +13,19 @@ Only the optional laptop-side refresher (`refresher/`) changes. The collector im
 - **Bounded ssh calls.** After ssh exits or is killed, its output pipes are read for at most 250 ms more, so a helper process that inherited them cannot hold a run.
 - **One run at a time.** A non-blocking `flock(2)` on `$XDG_RUNTIME_DIR/xiaomi-session-refresh.lock`; a second run prints `busy (another run is in progress)` and exits 1 without writing. `--check` takes no lock.
 - **Writer race.** The remote writer's `push` mode reads the installed session and its size through one descriptor, so a concurrent rename can no longer cause a spurious `account_mismatch` (exit 8).
-- **Local state** in `~/.local/state/xiaomi-session-refresh/state.json` (0600 in a 0700 directory): results, counts and collector timestamps only.
-- **Timing.** Run deadline 120 s (was 100 s); `TimeoutStartSec=180` (was 150) in both units covers the deadline plus tab close, `Browser.close`, the final status write and one notification. Both units add `StateDirectory=xiaomi-session-refresh` and `StateDirectoryMode=0700`.
+- **Local state** in `~/.local/state/xiaomi-session-refresh-state/state.json` (0600 in a 0700 directory): results, counts and collector timestamps only.
+- **Timing.** Run deadline 120 s (was 100 s); `TimeoutStartSec=180` (was 150) in both units covers the deadline plus tab close, `Browser.close`, the final status write and one notification. Both units add `StateDirectory=xiaomi-session-refresh-state` and `StateDirectoryMode=0700`.
 
 ## Upgrade and compatibility
 
 Follow [upgrading the refresher to v0.3.1](deployment.md#upgrading-the-refresher-to-v031): it adds a unit, changes the timer's `Unit=` and keeps the settings in one environment file. Nothing changes on the collector host. Healthy runs can now report `browser_unavailable` while the browser is down, which earlier versions never did. Timer runs now log under `xiaomi-session-refresh-scheduled.service`. The run lock needs Linux with glibc (`libc.so.6`).
 
 Details: [session renewal](session-renewal.md); evidence: [verification](verification.md#v031--2026-10-29-branch-featv031-refresher).
+
+## v0.3.2
+
+Fix only. `StateDirectory=xiaomi-session-refresh` collided with the identically
+named `~/.config/xiaomi-session-refresh`: systemd 253+ makes the state path a
+compatibility symlink into the config directory, so the state write failed with
+`; state not saved`. Both units now use `StateDirectory=xiaomi-session-refresh-state`.
+No behaviour change otherwise; found on the first install of v0.3.1.

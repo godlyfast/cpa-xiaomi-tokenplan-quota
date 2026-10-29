@@ -23,7 +23,7 @@ Description=Renew the Xiaomi MiMo collector session now (manual retry, never bac
 [Service]
 Type=oneshot
 TimeoutStartSec=180
-StateDirectory=xiaomi-session-refresh
+StateDirectory=xiaomi-session-refresh-state
 StateDirectoryMode=0700
 Environment=PATH=%h/.bun/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 EnvironmentFile=%h/.config/xiaomi-session-refresh/env
