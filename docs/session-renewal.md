@@ -55,7 +55,7 @@ The collector's account binding (`ACCOUNT_LABEL`, `ACCOUNT_BINDING_CONFIRMED=tru
 
 - **Renewals keep the binding.** A normal run (timer or manual) installs only a session with the same `userId`. If the installed file is missing, a symlink, larger than 16386 bytes, not printable ASCII, or does not contain exactly one non-empty `userId`, the comparison is impossible and the run also reports `account_mismatch`. The collector and the plugin do not compare accounts themselves.
 - **Use a browser profile signed in only to the bound account.** If the renewal browser is signed in to a different Xiaomi account, nothing is visible while the current session is healthy, because normal runs do not open the browser. After the next rejection, every run loads the console, validates that other account's cookies with Xiaomi, sends them over ssh stdin to the writer, and the writer refuses them before creating any file. The result is `account_mismatch`, the session file is unchanged, and the collector stays blocked (quota unavailable) until someone signs the renewal browser into the bound account or deliberately rebinds. The page and `quota.fetch` say so.
-- **First install or a deliberate account switch.** Run the refresher once by hand with `--rebind` (add `--force` if the collector is currently healthy; `--rebind` does not imply it). Then set `ACCOUNT_LABEL` for the new account, reconfirm `ACCOUNT_BINDING_CONFIRMED` and the plugin's `auth_index` for it, and redeploy the collector. The timer never passes `--rebind`; never add it to the unit.
+- **First install or a deliberate account switch.** Run the refresher once by hand with `--rebind` (add `--force` if the collector is currently healthy; `--rebind` does not imply it). Then set `ACCOUNT_LABEL` for the new account, reconfirm `ACCOUNT_BINDING_CONFIRMED` and the plugin's `auth_index` for it, and redeploy the collector. Neither unit passes `--rebind`; never add it to either.
 
 The check compares the vendor's `userId` cookie value only. It guards against mistakes and a mis-signed-in browser, not against a compromised laptop: the refresher's ssh key can run the writer in `rebind` mode.
 
@@ -112,18 +112,23 @@ The console wait (step 4) ends **loaded** when the tab's own `GET …/tokenPlan/
 
 ## Backoff
 
-Only **timer-triggered** runs back off. The timer activates `xiaomi-session-refresh.service`, which sets `XQ_TIMER_RUN=1`; a run counts as timer-triggered if and only if that variable is `1`. `TRIGGER_UNIT` is not used: systemd keeps a unit's activation details after its first timer start, so a later manual `systemctl --user start` of the same unit inherits `TRIGGER_UNIT=…​.timer`. `XQ_MANUAL_COMMAND` is therefore a direct `bun …/refresh-session.ts` run, which carries no `XQ_TIMER_RUN` and always bypasses backoff, as do any direct `bun` run and `--force`.
+Only **timer-triggered** runs back off. The two example units share one environment file and differ only here:
+
+- `xiaomi-session-refresh-scheduled.service` is the unit the timer starts (`Unit=` in the timer). It sets `XQ_TIMER_RUN=1`, and a run counts as timer-triggered if and only if that variable is `1`.
+- `xiaomi-session-refresh.service` is the manual retry: `XQ_MANUAL_COMMAND` in the example is `systemctl --user start xiaomi-session-refresh.service`. Its `UnsetEnvironment=XQ_TIMER_RUN` drops the variable even if the environment file or the user manager sets it, so it never backs off. Direct `bun` runs, which do not set it, and `--force` never back off either.
+
+`TRIGGER_UNIT` is not used to tell the two apart: systemd.exec(5) calls it best-effort and lossy. Never start the scheduled unit by hand to retry; it may back off.
 
 - **Which results:** after `signin_required`, `account_mismatch` or a vendor change, the next browser-path attempt waits min(60, 15 × 2^(n−1)) minutes after the last attempt, n being the number of consecutive runs with that result: 15, 30, 60, 60, … minutes. `browser_unavailable`, `vendor_unavailable`, `collector_unreachable` and other `error` results never back off.
 - **Bypass on change:** a run attempts again as soon as the collector's `session.rejectedAt` or `session.updatedAt` differs from the values recorded at the last attempt (a new rejection or a replaced file).
-- **A backed-off run** does no browser, Xiaomi or push work. It rewrites the last failure result to the status file (fresh `checkedAt`, so the page keeps the same advice and does not go stale), exits with that result's exit code and logs, for example: `signin_required (backing off until 21:45Z after 2 attempts; run "bun ~/.local/share/xiaomi-session-refresh/refresh-session.ts" to retry now; collector auth_required since …)`. It does not count as an attempt.
+- **A backed-off run** does no browser, Xiaomi or push work. It rewrites the last failure result to the status file (fresh `checkedAt`, so the page keeps the same advice and does not go stale), exits with that result's exit code and logs, for example: `signin_required (backing off until 21:45Z after 2 attempts; run "systemctl --user start xiaomi-session-refresh.service" to retry now; collector auth_required since …)`. It does not count as an attempt.
 - After signing in again, run the manual command instead of waiting.
 
 ## Run state and lock
 
-**State file.** `$STATE_DIRECTORY/state.json`; the unit's `StateDirectory=xiaomi-session-refresh` makes that `~/.local/state/xiaomi-session-refresh`. Direct runs use `$XDG_STATE_HOME/xiaomi-session-refresh`, else `~/.local/state/xiaomi-session-refresh`: the same directory. The directory is 0700 and the file 0600, written through a temporary file and a rename. It holds only: schema version, last result (a status result or `vendor_changed`), the number of consecutive runs with that result, the time of the last browser-path attempt, the collector's `rejectedAt` and `updatedAt` seen at that attempt, and the needs-a-person result last notified. No secrets and no userId. An unreadable, unsafe (symlink, not a regular file, over 4 KiB) or corrupt file counts as empty; a failed save appends `; state not saved` to the line. Neither is ever fatal. `--check`, `collector_unreachable` and interrupted runs do not change it.
+**State file.** `$STATE_DIRECTORY/state.json`; both units' `StateDirectory=xiaomi-session-refresh` makes that `~/.local/state/xiaomi-session-refresh`. Direct runs use `$XDG_STATE_HOME/xiaomi-session-refresh`, else `~/.local/state/xiaomi-session-refresh`: the same directory. The directory is 0700 and the file 0600, written through a temporary file and a rename. It holds only: schema version, last result (a status result or `vendor_changed`), the number of consecutive runs with that result, the time of the last browser-path attempt, the collector's `rejectedAt` and `updatedAt` seen at that attempt, and the needs-a-person result last notified. No secrets and no userId. An unreadable, unsafe (symlink, not a regular file, over 4 KiB) or corrupt file counts as empty; a failed save appends `; state not saved` to the line. Neither is ever fatal. `--check`, `collector_unreachable` and interrupted runs do not change it.
 
-**Run lock.** Every run except `--check` first takes a non-blocking exclusive `flock(2)` on `$XDG_RUNTIME_DIR/xiaomi-session-refresh.lock` (or `run.lock` in the state directory when `XDG_RUNTIME_DIR` is unset), through `bun:ffi` and glibc's `libc.so.6`. The kernel releases it when the process exits, even after SIGKILL. If another run holds it, the run prints `xiaomi-session-refresh: busy (another run is in progress)` and exits 1 without writing anything. If the lock cannot be taken at all it prints `run lock unavailable` and exits 1. Timer runs and manual runs exclude each other only if both see the same `XDG_RUNTIME_DIR` (the user manager and a login shell normally do).
+**Run lock.** Every run except `--check` first takes a non-blocking exclusive `flock(2)` on `$XDG_RUNTIME_DIR/xiaomi-session-refresh.lock` (or `run.lock` in the state directory when `XDG_RUNTIME_DIR` is unset), through `bun:ffi` and glibc's `libc.so.6`. The kernel releases it when the process exits, even after SIGKILL. If another run holds it, the run prints `xiaomi-session-refresh: busy (another run is in progress)` and exits 1 without writing anything. If the lock cannot be taken at all it prints `run lock unavailable` and exits 1. Timer runs and manual runs exclude each other only if both see the same `XDG_RUNTIME_DIR`: both units run under the user manager, and a login shell normally sees the same directory.
 
 ## Security model
 
@@ -149,7 +154,7 @@ Only **timer-triggered** runs back off. The timer activates `xiaomi-session-refr
 
 ## Configuration
 
-Environment only; no configuration file. Invalid values stop the run with exit 1 and a fixed message (`invalid configuration: …`) before any network or browser access; the rejected value is never echoed.
+The refresher reads its environment only. The example units load the `XQ_*` settings from one file, `~/.config/xiaomi-session-refresh/env` (`EnvironmentFile=`; example `refresher/systemd/env.example`), which the smoke test also sources. Invalid values stop the run with exit 1 and a fixed message (`invalid configuration: …`) before any network or browser access; the rejected value is never echoed.
 
 | Variable | Default | Validation |
 | --- | --- | --- |
@@ -158,13 +163,13 @@ Environment only; no configuration file. Invalid values stop the run with exit 1
 | `XQ_REMOTE_DIR` | required | One or more `/segment` parts, each `[A-Za-z0-9._-]+`; no `.` or `..` segment, no empty segment (`//`) and no trailing `/`. The collector's session directory on the host |
 | `XQ_COLLECTOR_CONTAINER` | required | `[A-Za-z0-9][A-Za-z0-9_.-]{0,127}`; the actual container name for `docker exec` (Compose names containers `<project>-<service>-<n>` unless `container_name` is set) |
 | `XQ_HOST_LABEL` | hostname, other characters → `-`, leading non-alphanumerics removed, 64 characters | `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`; shown on the page as the renewal host |
-| `XQ_MANUAL_COMMAND` | none | 1–160 printable ASCII characters; shown verbatim on the page as the command to run on that host, and in notifications and backoff lines |
+| `XQ_MANUAL_COMMAND` | none (the example: `systemctl --user start xiaomi-session-refresh.service`) | 1–160 printable ASCII characters; shown verbatim on the page as the command to run on that host, and in notifications and backoff lines. Point it at something that runs with the full configuration and does not back off, such as the manual unit |
 | `XQ_BROWSER_LAUNCH` | none (never start a browser) | Absolute path without control characters, at most 4096 characters; the file is checked again at every use ([starting the renewal browser](#starting-the-renewal-browser)) |
 | `XQ_NOTIFY` | `none` | `desktop` or `none` ([notifications](#notifications)) |
 
 Empty `XQ_CDP_URL`, `XQ_HOST_LABEL`, `XQ_MANUAL_COMMAND`, `XQ_BROWSER_LAUNCH` or `XQ_NOTIFY` means unset. Flags: `--check`, `--force` and `--rebind`; anything else is a usage error (exit 1).
 
-The refresher also reads, without validation errors: `XQ_TIMER_RUN` (`1` only in the timer-activated unit; [backoff](#backoff)), `STATE_DIRECTORY`, `XDG_STATE_HOME` and `HOME` (state directory; a value that is not absolute is ignored) and `XDG_RUNTIME_DIR` (run lock).
+The refresher also reads, without validation errors: `XQ_TIMER_RUN` (`1` only in `xiaomi-session-refresh-scheduled.service`, the unit the timer starts; never in the environment file; [backoff](#backoff)), `STATE_DIRECTORY`, `XDG_STATE_HOME` and `HOME` (state directory; a value that is not absolute is ignored) and `XDG_RUNTIME_DIR` (run lock).
 
 Timeouts and URLs are fixed:
 
@@ -185,7 +190,7 @@ Timeouts and URLs are fixed:
 | `Browser.close` of a browser this run started | 3 s |
 | Desktop notification | 5 s |
 
-A **run deadline of 120 s** caps every step up to and including the install push, including a browser launch and its wait. A step that reaches it ends the run as `error (run deadline exceeded; …)`. The exception is an install push cut off by it, which is reported as `error (session push failed: …)`. Only the local ssh client is killed then, so the remote rename may still have happened; the collector picks up such a session normally. After the deadline only the owned-tab close (2 s), `Browser.close` of a browser the run started (3 s), one final status write (20 s) and one desktop notification (5 s) can still run. A run therefore ends within about 150 s plus process start-up, inside the unit's `TimeoutStartSec=180`; a test keeps that invariant.
+A **run deadline of 120 s** caps every step up to and including the install push, including a browser launch and its wait. A step that reaches it ends the run as `error (run deadline exceeded; …)`. The exception is an install push cut off by it, which is reported as `error (session push failed: …)`. Only the local ssh client is killed then, so the remote rename may still have happened; the collector picks up such a session normally. After the deadline only the owned-tab close (2 s), `Browser.close` of a browser the run started (3 s), one final status write (20 s) and one desktop notification (5 s) can still run. A run therefore ends within about 150 s plus process start-up, inside both units' `TimeoutStartSec=180`; a test keeps that invariant.
 
 The refresher always writes the file names `mimo_session` and `renewal-status.json` in `XQ_REMOTE_DIR`. The collector's `MIMO_COOKIE_FILE` must therefore be `<mounted dir>/mimo_session`, with `RENEWAL_STATUS_FILE` at its default.
 
@@ -196,28 +201,31 @@ Prerequisites:
 - **Collector host:** a v0.3.0 collector with the directory mount from [deployment](deployment.md#session-directory-mount); an ssh user whose UID equals the collector's (1000 in the proposal) and who owns the 0700 session directory; bash and GNU coreutils; `sudo -n docker exec <container> …` permitted for that user.
 - **Laptop:** Bun (1.3.14 is the tested version; the refresher tests also pass on 1.4.3) on Linux with glibc (the run lock loads `libc.so.6`), the OpenSSH client with the host key already in `known_hosts`, and a dedicated Chrome profile with a loopback `--remote-debugging-port`, signed in to the Xiaomi console **with the bound account only**. Recent Chrome versions refuse remote debugging on the default profile directory, so use a dedicated `--user-data-dir`. Either keep that browser running, or give the refresher a [launcher](#starting-the-renewal-browser) that can start it. Optional: `notify-send` (libnotify) for [notifications](#notifications).
 
-Install a copy of `refresher/` (both files; `refresh-session.ts` imports `./lib`), optionally the launcher, and the example units:
+Install a copy of `refresher/` (both files; `refresh-session.ts` imports `./lib`), optionally the launcher, the environment file and the three example units:
 
 ```sh
-install -d -m 700 ~/.local/share/xiaomi-session-refresh
+install -d -m 700 ~/.local/share/xiaomi-session-refresh ~/.config/xiaomi-session-refresh
 install -m 600 refresher/lib.ts refresher/refresh-session.ts ~/.local/share/xiaomi-session-refresh/
 # optional, Hyprland with the Lua config provider; set id= in the copy to your desktop entry
 install -m 700 refresher/examples/launch-browser-hyprland.sh ~/.local/share/xiaomi-session-refresh/
+install -m 600 refresher/systemd/env.example ~/.config/xiaomi-session-refresh/env
 install -d ~/.config/systemd/user
 install -m 644 refresher/systemd/xiaomi-session-refresh.service \
+  refresher/systemd/xiaomi-session-refresh-scheduled.service \
   refresher/systemd/xiaomi-session-refresh.timer ~/.config/systemd/user/
 ```
 
-Edit the service's `Environment=` placeholders (`XQ_SSH_TARGET`, `XQ_REMOTE_DIR`, `XQ_COLLECTOR_CONTAINER`, `XQ_CDP_URL`, `XQ_MANUAL_COMMAND`, optionally `XQ_HOST_LABEL`, `XQ_BROWSER_LAUNCH` and `XQ_NOTIFY`) and its `PATH` so `bun` resolves. `BatchMode=yes` needs an unencrypted key or an agent whose `SSH_AUTH_SOCK` is visible to the user manager (`systemctl --user import-environment SSH_AUTH_SOCK`, or an `Environment=` line). A launcher and `notify-send` need the graphical session's variables in the user manager (`systemctl --user show-environment`). The desktop entry the example launcher reads must start the browser with the same `--remote-debugging-port` as `XQ_CDP_URL` and name its profile with `--user-data-dir=<absolute path>`.
+Edit the placeholders in `~/.config/xiaomi-session-refresh/env` (`XQ_SSH_TARGET`, `XQ_REMOTE_DIR`, `XQ_COLLECTOR_CONTAINER`, `XQ_CDP_URL`, optionally `XQ_HOST_LABEL`, `XQ_BROWSER_LAUNCH` and `XQ_NOTIFY`); keep `XQ_MANUAL_COMMAND` as shipped unless you rename the manual unit. Both systemd and `sh` read this file: one `KEY=value` per line, double quotes around a value with spaces, absolute paths (systemd expands neither `%h` nor `~` there), no `$`. Never put `XQ_TIMER_RUN` in it. Set `PATH` in both units so `bun` resolves. `BatchMode=yes` needs an unencrypted key or an agent whose `SSH_AUTH_SOCK` is visible to the user manager (`systemctl --user import-environment SSH_AUTH_SOCK`, or an `Environment=` line in both units). A launcher and `notify-send` need the graphical session's variables in the user manager (`systemctl --user show-environment`). The desktop entry the example launcher reads must start the browser with the same `--remote-debugging-port` as `XQ_CDP_URL` and name its profile with `--user-data-dir=<absolute path>`.
 
-Before enabling the timer, run an **end-to-end smoke test**. `--check` and a normal run against a healthy collector never open a tab or read a cookie: they prove only ssh, sudo, `docker exec`, browser readiness (the discovery endpoint or `launcher --check`) and (normal run) the status write. A browser that is not signed in, or changed cookie names, would then surface only at the first real expiry. In a shell with the same `XQ_*` variables exported as in the unit:
+Before enabling the timer, run an **end-to-end smoke test**. `--check` and a normal run against a healthy collector never open a tab or read a cookie: they prove only ssh, sudo, `docker exec`, browser readiness (the discovery endpoint or `launcher --check`) and (normal run) the status write. A browser that is not signed in, or changed cookie names, would then surface only at the first real expiry. In bash or zsh, `xq` runs the refresher directly with the environment file, in a subshell, and never sets `XQ_TIMER_RUN`:
 
 ```sh
 r=~/.local/share/xiaomi-session-refresh/refresh-session.ts
-bun "$r" --check            # expect: check: not_needed (collector ok; renewal browser …), or renewal needed
-bun "$r" --force            # collector already holds a session of the bound account
-bun "$r" --force --rebind   # instead: first install or account switch, collector healthy
-bun "$r" --rebind           # instead: first install, collector has no usable session yet
+xq() ( set -a; . ~/.config/xiaomi-session-refresh/env; set +a; exec bun "$r" "$@" )
+xq --check            # expect: check: not_needed (collector ok; renewal browser …), or renewal needed
+xq --force            # collector already holds a session of the bound account
+xq --force --rebind   # instead: first install or account switch, collector healthy
+xq --rebind           # instead: first install, collector has no usable session yet
 ```
 
 Run `--check`, then exactly one of the other three:
@@ -228,34 +236,35 @@ Run `--check`, then exactly one of the other three:
 
 With a launcher, quit the renewal browser before the `--force` run, so it also proves the launch, the 20 s wait and the closing `Browser.close`; `--check` should first report `renewal browser not running but can be started`.
 
-A healthy collector picks up a forced session on its next 5-minute poll; the page then shows the agent's last renewal. Then check the unit's own environment and enable the timer:
+A healthy collector picks up a forced session on its next 5-minute poll; the page then shows the agent's last renewal. Then run the manual unit once (the `XQ_MANUAL_COMMAND` operators will be shown), enable the timer and check which unit it starts:
 
 ```sh
 systemctl --user daemon-reload
 systemctl --user start xiaomi-session-refresh.service
 journalctl --user -u xiaomi-session-refresh.service -n 5 --no-pager
 systemctl --user enable --now xiaomi-session-refresh.timer
+systemctl --user show -p Triggers xiaomi-session-refresh.timer   # Triggers=xiaomi-session-refresh-scheduled.service
 ```
 
-The service is `Type=oneshot`, `TimeoutStartSec=180`, `StateDirectory=xiaomi-session-refresh` with `StateDirectoryMode=0700`, `NoNewPrivileges=yes`. The timer fires every 5 minutes (`OnCalendar=*:0/5`) with `Persistent=true`, so runs missed during suspend fire on resume. A failed run marks the service failed; the timer keeps firing.
+Both services are `Type=oneshot`, `TimeoutStartSec=180`, `StateDirectory=xiaomi-session-refresh` with `StateDirectoryMode=0700`, `NoNewPrivileges=yes`, with the same `ExecStart` and `EnvironmentFile=%h/.config/xiaomi-session-refresh/env`. They differ only in `XQ_TIMER_RUN` ([backoff](#backoff)); a test keeps them that way. Neither has an `[Install]` section: only the timer is enabled. The timer fires every 5 minutes (`OnCalendar=*:0/5`) with `Persistent=true`, so runs missed during suspend fire on resume. A failed run marks its service failed; the timer keeps firing.
 
-**Upgrade from v0.3.0:** copy both files again (and the launcher, if used), compare the installed service with the new example (`TimeoutStartSec=180`, `StateDirectory=xiaomi-session-refresh`, `StateDirectoryMode=0700`, the optional `XQ_BROWSER_LAUNCH` and `XQ_NOTIFY` lines), run `systemctl --user daemon-reload`, then repeat `--check` and the `--force` smoke run. The timer is unchanged; the collector and plugin need no change. Healthy runs now report `browser_unavailable` while the renewal browser is neither running nor startable, or its port does not answer ([early warning](#early-warning)).
+**Upgrade from v0.3.0:** follow [upgrading the refresher to v0.3.1](deployment.md#upgrading-the-refresher-to-v031), the one list of steps. The timer now starts a new unit that backs off, and the existing `xiaomi-session-refresh.service` becomes the manual retry that never does; the collector and plugin need no change. Healthy runs now report `browser_unavailable` while the renewal browser is neither running nor startable, or its port does not answer ([early warning](#early-warning)).
 
 **Removal:**
 
 1. `systemctl --user disable --now xiaomi-session-refresh.timer`.
-2. Delete the units and the copy, then run `systemctl --user daemon-reload`. Optionally delete `~/.local/state/xiaomi-session-refresh`.
+2. Delete the three units, `~/.config/xiaomi-session-refresh` and the copy, then run `systemctl --user daemon-reload`. Optionally delete `~/.local/state/xiaomi-session-refresh`.
 3. On the collector host, delete `<session dir>/renewal-status.json`.
 
 Without step 3, a v0.3.0 collector keeps serving the last report. After 15 minutes the page and `quota.fetch` would keep pointing at the removed agent (wake it, restart its timer, run its stored command). Once the file is gone, the collector reports `renewal: null` within one session-check interval (15 s by default). The page then shows the no-agent guidance, including by-hand replacement.
 
 ## Operation
 
-Manual run with the same environment: `bun ~/.local/share/xiaomi-session-refresh/refresh-session.ts [--check] [--force] [--rebind]` (this is `XQ_MANUAL_COMMAND`, and it bypasses backoff). A `systemctl --user start xiaomi-session-refresh.service` runs the same way but counts as a timer run (it sets `XQ_TIMER_RUN=1` and inherits any `TRIGGER_UNIT`), so after a needs-a-person failure it may back off; prefer the direct `bun` run to retry now.
+**Retry now** (for example after signing in): `systemctl --user start xiaomi-session-refresh.service`, the example `XQ_MANUAL_COMMAND`. It runs with the environment file, never backs off, and returns when the run ends (non-zero if it failed). Its line is in `journalctl --user -u xiaomi-session-refresh.service`; timer runs log under `xiaomi-session-refresh-scheduled.service`, and `journalctl --user -u 'xiaomi-session-refresh*'` shows both. Do not start the scheduled unit by hand to retry: it may back off. For the flags, run the refresher directly with the same file, `xq [--check] [--force] [--rebind]` (the function from the [smoke test](#installation)); direct runs never back off either.
 
 - `--check` reads the collector status and prints the decision and the renewal browser's readiness (discovery endpoint, else `launcher --check`): no tab, no Xiaomi request, no write, no run lock.
 - `--force` renews even when the collector is healthy. A healthy collector reads the replaced file on its next 5-minute poll; a blocked one within the session-check interval. It is the only way to exercise the browser path while the collector is healthy.
-- `--rebind` installs the browser's session even if its `userId` differs from the installed session's, or the installed file is missing or has no single `userId`. It does not imply `--force`. Use it only for the first install or a deliberate account switch, then update `ACCOUNT_LABEL` and the binding. The timer never passes it.
+- `--rebind` installs the browser's session even if its `userId` differs from the installed session's, or the installed file is missing or has no single `userId`. It does not imply `--force`. Use it only for the first install or a deliberate account switch, then update `ACCOUNT_LABEL` and the binding. Neither unit passes it.
 
 Each run prints one line prefixed `xiaomi-session-refresh: `, on stdout for exit 0 and on stderr otherwise. The forms are:
 
@@ -381,7 +390,7 @@ A blocked collector loads it within the session-check interval and a healthy one
 - Cookie names, the about-24 h lifetime, silent re-minting through the account sign-in and the response codes are undocumented vendor behaviour observed in one deployment. Validation gates every install but cannot prevent future breakage.
 - Sign-in detection is a heuristic (8 s grace on a main-frame account-host document; 45 s console wait). A slow SSO hop or a changed console can be misclassified as `signin_required` or `vendor_unavailable`; validation still prevents installing a rejected session.
 - Readiness relies on the tab's Resource Timing entries. `responseStatus` needs Chrome 109 or later, and the default buffer holds 250 entries. If the usage request is not recorded, the refresher waits the full 45 s and then reads and validates the cookies anyway.
-- A run takes at most about 150 s plus start-up (120 s deadline, 2 s tab close, 3 s `Browser.close`, 20 s final status write, 5 s notification), under the unit's `TimeoutStartSec=180`.
+- A run takes at most about 150 s plus start-up (120 s deadline, 2 s tab close, 3 s `Browser.close`, 20 s final status write, 5 s notification), under the units' `TimeoutStartSec=180`.
 - [Vendor-change](#vendor-change) detection trusts the tab's usage request status. If the console ever answered that request with HTTP 200 and an authentication failure in the body, a not-signed-in browser would be reported as a vendor change rather than `signin_required` (both notify and back off; the advice differs).
 - When the account sign-in lapses or Xiaomi requires interactive verification (password, MFA, captcha), someone must sign in again in the renewal browser. The refresher never enters credentials.
 - The account check compares the vendor's `userId` cookie only. The first install and every deliberate account switch need a manual `--rebind`. The collector trims Unicode whitespace such as a UTF-8 BOM or a no-break space around a hand-installed session, but the writer trims only ASCII whitespace. Such a file therefore works for the collector, while renewals report `account_mismatch` until it is rewritten or `--rebind` is used.

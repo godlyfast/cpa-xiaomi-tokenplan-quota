@@ -1822,9 +1822,9 @@ test("config: launcher path, notification mode and timer trigger", () => {
     notify: "none",
   });
   expect(lib.parseConfig({ ...ENV, XQ_NOTIFY: "none" }, "h").notify).toBe("none");
-  // Only the timer-triggered unit sets XQ_TIMER_RUN=1. The manual `bun` retry
-  // and a leftover TRIGGER_UNIT (which sticks on the unit after its first timer
-  // start) must never count as a timer run.
+  // Only the unit the timer starts sets XQ_TIMER_RUN=1. Any other value and a
+  // TRIGGER_UNIT (best-effort and lossy per systemd.exec(5)) never count as a
+  // timer run.
   for (const v of [undefined, "", "0", "2", "true", "01", " 1"])
     expect(lib.parseConfig({ ...ENV, XQ_TIMER_RUN: v }, "h").timerRun).toBe(false);
   expect(
@@ -2732,25 +2732,223 @@ test("remote writer: a rename between reading and sizing the installed session c
   });
 });
 
-test("unit: TimeoutStartSec covers the deadline and every bounded step after it", async () => {
-  const unit = await readFile(join(import.meta.dir, "systemd", "xiaomi-session-refresh.service"), "utf8");
-  const lines = unit.split("\n").filter((l) => !l.startsWith("#"));
-  const timeout = lines.filter((l) => l.startsWith("TimeoutStartSec="));
-  expect(timeout.length).toBe(1);
-  const seconds = Number(timeout[0].slice("TimeoutStartSec=".length));
-  expect(Number.isInteger(seconds)).toBe(true);
+const SYSTEMD = join(import.meta.dir, "systemd");
+const TIMER = "xiaomi-session-refresh.timer";
+// [section, key, value] of a unit file; comments and blank lines dropped.
+function directives(text: string): [string, string, string][] {
+  const out: [string, string, string][] = [];
+  let section = "";
+  for (const raw of text.split("\n")) {
+    const line = raw.trim();
+    if (line === "" || line.startsWith("#") || line.startsWith(";")) continue;
+    if (line.startsWith("[")) section = line;
+    else out.push([section, line.slice(0, line.indexOf("=")), line.slice(line.indexOf("=") + 1)]);
+  }
+  return out;
+}
+const unitText = (name: string) => readFile(join(SYSTEMD, name), "utf8");
+const serviceLines = async (name: string) =>
+  directives(await unitText(name))
+    .filter(([section]) => section === "[Service]")
+    .map(([, k, v]) => k + "=" + v);
+// The unit the timer starts: its Unit=, else the timer's own name.
+async function timerUnit(): Promise<string> {
+  const unit = directives(await unitText(TIMER)).find(([s, k]) => s === "[Timer]" && k === "Unit");
+  return unit ? unit[2] : TIMER.replace(/\.timer$/, ".service");
+}
+// The env-file subset systemd and sh read alike: KEY=value or KEY="value", no quotes,
+// escapes or $ inside; anything else fails the test.
+function envFile(text: string): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const raw of text.split("\n")) {
+    const line = raw.trim();
+    if (line === "" || line.startsWith("#") || line.startsWith(";")) continue;
+    const m = /^([A-Z_][A-Z0-9_]*)=(?:"([^"'\\$`]*)"|([^\s"'\\$`]*))$/.exec(line);
+    expect({ line, ok: m !== null }).toEqual({ line, ok: true });
+    env[m![1]] = m![2] ?? m![3];
+  }
+  return env;
+}
+// A unit's process environment per systemd.exec(5): the user manager's environment,
+// then Environment= in order, then EnvironmentFile= (overrides), then UnsetEnvironment=.
+async function unitEnv(
+  name: string,
+  home: string,
+  o: { manager?: Record<string, string>; file?: string } = {},
+): Promise<Record<string, string>> {
+  const env: Record<string, string> = { ...o.manager };
+  let file: Record<string, string> = {};
+  const unset: string[] = [];
+  for (const line of await serviceLines(name)) {
+    const [k, v] = [line.slice(0, line.indexOf("=")), line.slice(line.indexOf("=") + 1)];
+    if (k === "Environment") {
+      const quoted = v.startsWith('"') && v.endsWith('"');
+      if (!quoted) expect(v).not.toMatch(/\s/);
+      const a = (quoted ? v.slice(1, -1) : v).replaceAll("%h", home);
+      env[a.slice(0, a.indexOf("="))] = a.slice(a.indexOf("=") + 1);
+    } else if (k === "EnvironmentFile") {
+      expect(v).toBe("%h/.config/xiaomi-session-refresh/env");
+      file = envFile(o.file ?? (await unitText("env.example")));
+    } else if (k === "UnsetEnvironment") {
+      for (const n of v.split(/\s+/)) {
+        expect(n).toMatch(/^[A-Z_][A-Z0-9_]*$/);
+        unset.push(n);
+      }
+    }
+  }
+  Object.assign(env, file);
+  for (const n of unset) delete env[n];
+  return env;
+}
+
+test("units: TimeoutStartSec covers the deadline and every bounded step after it", async () => {
   const d = lib.DEFAULT_TIMEOUTS;
   expect(d.runMs).toBe(120000);
   expect(lib.worstCaseMs(d)).toBe(d.runMs + d.closeMs + d.browserCloseMs + d.writeSshMs + d.notifyMs);
-  // Margin for start-up, the lock and the state write.
-  expect(seconds * 1000 - lib.worstCaseMs(d)).toBeGreaterThanOrEqual(15000);
   // A launch fits the deadline together with the steps before the browser.
   expect(d.statusSshMs + d.connectMs + d.launcherMs + d.launchMs + d.connectMs).toBeLessThan(d.runMs);
   expect([d.launcherMs, d.launchMs, d.browserCloseMs, d.notifyMs, d.pollMs]).toEqual([5000, 20000, 3000, 5000, 250]);
-  for (const line of ["Type=oneshot", "StateDirectory=xiaomi-session-refresh", "StateDirectoryMode=0700", "NoNewPrivileges=yes"])
-    expect(lines).toContain(line);
-  expect(lines.find((l) => l.startsWith("ExecStart="))).not.toMatch(/--rebind|--force/);
+  const manual = /^systemctl --user start (\S+\.service)$/.exec(
+    envFile(await unitText("env.example")).XQ_MANUAL_COMMAND ?? "",
+  )?.[1];
+  for (const name of [await timerUnit(), manual!]) {
+    const lines = await serviceLines(name);
+    const timeout = lines.filter((l) => l.startsWith("TimeoutStartSec="));
+    expect({ name, count: timeout.length }).toEqual({ name, count: 1 });
+    const seconds = Number(timeout[0].slice("TimeoutStartSec=".length));
+    expect(Number.isInteger(seconds)).toBe(true);
+    // Margin for start-up, the lock and the state write.
+    expect(seconds * 1000 - lib.worstCaseMs(d)).toBeGreaterThanOrEqual(15000);
+    for (const line of ["Type=oneshot", "StateDirectory=xiaomi-session-refresh", "StateDirectoryMode=0700", "NoNewPrivileges=yes"])
+      expect({ name, lines }).toEqual({ name, lines: expect.arrayContaining([line]) });
+    expect(lines.find((l) => l.startsWith("ExecStart="))).not.toMatch(/--rebind|--force/);
+  }
 });
+
+// The command shown on the page, in notifications and in backoff lines must start a
+// unit that carries the whole configuration and never backs off; the unit the timer
+// starts must back off.
+test("units: the timer's unit backs off; the unit XQ_MANUAL_COMMAND starts has the full environment and never does", async () => {
+  const home = "/home/user";
+  const envText = await unitText("env.example");
+  const fileEnv = envFile(envText);
+  expect(Object.keys(fileEnv).filter((k) => !k.startsWith("XQ_"))).toEqual([]);
+  expect(fileEnv.XQ_TIMER_RUN).toBeUndefined();
+  const scheduled = await timerUnit();
+  const manual = /^systemctl --user start (\S+\.service)$/.exec(fileEnv.XQ_MANUAL_COMMAND ?? "")?.[1];
+  expect([scheduled, manual]).toEqual(["xiaomi-session-refresh-scheduled.service", "xiaomi-session-refresh.service"]);
+  expect(fileEnv.XQ_MANUAL_COMMAND).toBe(ENV.XQ_MANUAL_COMMAND);
+
+  // Both parse with no other environment; only timerRun differs.
+  const t = lib.parseConfig(await unitEnv(scheduled, home), "h");
+  const m = lib.parseConfig(await unitEnv(manual!, home), "h");
+  expect([t.timerRun, m.timerRun]).toEqual([true, false]);
+  expect({ ...t, timerRun: false }).toEqual(m);
+  expect(m.manualCommand).toBe(fileEnv.XQ_MANUAL_COMMAND);
+  // A stray XQ_TIMER_RUN=1 in the env file or the user manager cannot make a manual retry back off.
+  for (const o of [{ manager: { XQ_TIMER_RUN: "1" } }, { file: envText + "XQ_TIMER_RUN=1\n" }])
+    expect(lib.parseConfig(await unitEnv(manual!, home, o), "h").timerRun).toBe(false);
+
+  // The services differ only in that marker; only the timer is enabled.
+  const ts = await serviceLines(scheduled);
+  const ms = await serviceLines(manual!);
+  expect(ts.filter((l) => l.includes("XQ_TIMER_RUN"))).toEqual(["Environment=XQ_TIMER_RUN=1"]);
+  expect(ms.filter((l) => l.includes("XQ_TIMER_RUN"))).toEqual(["UnsetEnvironment=XQ_TIMER_RUN"]);
+  expect(ts.filter((l) => !l.includes("XQ_TIMER_RUN")).sort()).toEqual(ms.filter((l) => !l.includes("XQ_TIMER_RUN")).sort());
+  for (const name of [scheduled, manual!])
+    expect({ name, install: directives(await unitText(name)).some(([s]) => s === "[Install]") }).toEqual({ name, install: false });
+  expect(directives(await unitText(TIMER))).toContainEqual(["[Install]", "WantedBy", "timers.target"]);
+
+  // sh reads the env file exactly as systemd does (the smoke test sources it).
+  const p = Bun.spawn(["sh", "-c", 'set -a; . "$1"; env', "sh", join(SYSTEMD, "env.example")], {
+    env: { PATH: process.env.PATH! },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [code, out, err] = await Promise.all([p.exited, new Response(p.stdout).text(), new Response(p.stderr).text()]);
+  expect({ code, err }).toEqual({ code: 0, err: "" });
+  const shEnv = Object.fromEntries(
+    out.split("\n").filter((l) => l.startsWith("XQ_")).map((l) => [l.slice(0, l.indexOf("=")), l.slice(l.indexOf("=") + 1)]),
+  );
+  expect(shEnv).toEqual(fileEnv);
+  // Every optional setting is valid once uncommented.
+  const enabled = envText.replace(/^#(XQ_[A-Z_]+=)/gm, "$1");
+  expect(Object.keys(envFile(enabled)).sort()).toEqual(
+    [...Object.keys(fileEnv), "XQ_HOST_LABEL", "XQ_BROWSER_LAUNCH", "XQ_NOTIFY"].sort(),
+  );
+  expect(lib.parseConfig(await unitEnv(manual!, home, { file: enabled }), "h")).toMatchObject({
+    hostLabel: "workstation",
+    browserLaunch: envFile(enabled).XQ_BROWSER_LAUNCH,
+    notify: "desktop",
+    timerRun: false,
+  });
+});
+
+test("entrypoint: under the shipped units a timer run backs off, the manual command's unit retries at once", async () => {
+  const home = await mkdtemp(join(tmpdir(), "xq-units-"));
+  try {
+    const runtime = join(home, "run");
+    await mkdir(runtime);
+    // The units' PATH starts with %h/.bun/bin:%h/.local/bin, so a fake ssh there wins.
+    const bin = join(home, ".local", "bin");
+    await mkdir(bin, { recursive: true });
+    await writeFile(join(bin, "ssh"), `#!/bin/sh\ncat > /dev/null\nprintf '%s\\n' '${collector("auth_required")}'\n`, {
+      mode: 0o700,
+    });
+    // What StateDirectory=xiaomi-session-refresh provides: the directory and STATE_DIRECTORY.
+    const state = join(home, ".local", "state", "xiaomi-session-refresh");
+    await mkdir(state, { recursive: true, mode: 0o700 });
+    // Two sign-in failures, the last a minute ago, against the same collector session.
+    const attemptAt = new Date(Date.now() - 60000);
+    await writeFile(
+      join(state, "state.json"),
+      JSON.stringify({
+        ...lib.EMPTY_STATE,
+        last: "signin_required",
+        count: 2,
+        attemptAt: attemptAt.toISOString(),
+        attemptRejectedAt: REJECTED,
+        attemptUpdatedAt: UPDATED,
+      }),
+      { mode: 0o600 },
+    );
+    const cdp = "http://127.0.0.1:" + (await closedPort());
+    const start = async (unit: string) => {
+      const env: Record<string, string> = {
+        ...(await unitEnv(unit, home)),
+        HOME: home,
+        XDG_RUNTIME_DIR: runtime,
+        STATE_DIRECTORY: state,
+        XQ_CDP_URL: cdp,
+      };
+      // Never the example's browser port or a real ssh.
+      expect(env.XQ_CDP_URL).toBe(cdp);
+      expect(Bun.which("ssh", { PATH: env.PATH })).toBe(join(bin, "ssh"));
+      const p = Bun.spawn([process.execPath, join(import.meta.dir, "refresh-session.ts")], { env, stdout: "pipe", stderr: "pipe" });
+      const [code, out, err] = await Promise.all([p.exited, new Response(p.stdout).text(), new Response(p.stderr).text()]);
+      return { code, out, err };
+    };
+    const until = new Date(attemptAt.getTime() + 30 * 60000).toISOString().slice(11, 16) + "Z";
+    expect(await start(await timerUnit())).toEqual({
+      code: 2,
+      out: "",
+      err:
+        "xiaomi-session-refresh: signin_required (backing off until " + until + " after 2 attempts; " +
+        'run "systemctl --user start xiaomi-session-refresh.service" to retry now; collector auth_required since ' +
+        REJECTED + ")\n",
+    });
+    // Same state and collector: the unit that command starts goes straight to the browser.
+    const manual = await start("xiaomi-session-refresh.service");
+    expect(manual.code).toBe(1);
+    expect(manual.err).toStartWith("xiaomi-session-refresh: browser_unavailable (DevTools endpoint unreachable;");
+    expect(lib.parseState(await readFile(join(state, "state.json"), "utf8"))).toMatchObject({
+      last: "browser_unavailable",
+      count: 1,
+    });
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+}, 30000);
 
 const EXAMPLE = join(import.meta.dir, "examples", "launch-browser-hyprland.sh");
 const CHROME =

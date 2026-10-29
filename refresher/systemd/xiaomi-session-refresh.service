@@ -1,13 +1,16 @@
-# Example user unit. Install a copy of the refresher directory, edit the
-# placeholders, run the end-to-end smoke test in docs/session-renewal.md
-# (Installation) with these same XQ_* values, then:
+# Example user units. This one is the manual retry (XQ_MANUAL_COMMAND starts it);
+# xiaomi-session-refresh.timer starts xiaomi-session-refresh-scheduled.service
+# instead. Both read the XQ_* settings from one file (example: env.example) and
+# differ only in XQ_TIMER_RUN, so a timer run backs off and this unit never does.
+# Install a copy of the refresher directory, the env file and all three units,
+# run the end-to-end smoke test in docs/session-renewal.md (Installation), then:
 # systemctl --user daemon-reload && systemctl --user enable --now xiaomi-session-refresh.timer
 # ssh runs with BatchMode=yes: key auth only, known_hosts already trusted, and
 # an unencrypted key or an SSH_AUTH_SOCK agent visible to the user manager.
-# The timer never passes --rebind, so a renewal only replaces a session of the
+# Neither unit passes --rebind, so a renewal only replaces a session of the
 # same Xiaomi account (userId); otherwise it reports account_mismatch (exit 3).
 # The first install (no session on the collector host yet) and a deliberate
-# account switch need one manual run with this environment plus --rebind
+# account switch need one direct run with the env file plus --rebind
 # (add --force if the collector is healthy); then update ACCOUNT_LABEL.
 # The run stops itself after 120 s, then closes its tab (2 s) and a browser it
 # started (3 s), writes its status (20 s) and may send one desktop notification
@@ -15,7 +18,7 @@
 # before exiting. Run state (backoff, notifications) lives in StateDirectory;
 # the run lock is $XDG_RUNTIME_DIR/xiaomi-session-refresh.lock.
 [Unit]
-Description=Renew the Xiaomi MiMo collector session from the signed-in renewal browser
+Description=Renew the Xiaomi MiMo collector session now (manual retry, never backs off)
 
 [Service]
 Type=oneshot
@@ -23,21 +26,9 @@ TimeoutStartSec=180
 StateDirectory=xiaomi-session-refresh
 StateDirectoryMode=0700
 Environment=PATH=%h/.bun/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
-Environment=XQ_CDP_URL=http://127.0.0.1:9223
-Environment=XQ_SSH_TARGET=user@collector-host.example
-Environment=XQ_REMOTE_DIR=/srv/xiaomi-quota/session
-Environment=XQ_COLLECTOR_CONTAINER=xiaomi-quota
-# The timer activates this unit, so this unit's runs are the ones that back off.
-# TRIGGER_UNIT cannot tell them apart: it sticks on the unit after its first
-# timer start, so a manual `systemctl start` would inherit it. Mark the timer
-# run with an explicit env var, and keep the manual retry a direct `bun` run
-# (XQ_MANUAL_COMMAND) so it never carries XQ_TIMER_RUN and always bypasses backoff.
-Environment=XQ_TIMER_RUN=1
-Environment="XQ_MANUAL_COMMAND=bun %h/.local/share/xiaomi-session-refresh/refresh-session.ts"
-#Environment=XQ_HOST_LABEL=workstation
-# Optional: start the renewal browser when needed (refresher/examples), and a
-# desktop notification when a person is needed.
-#Environment=XQ_BROWSER_LAUNCH=%h/.local/share/xiaomi-session-refresh/launch-browser-hyprland.sh
-#Environment=XQ_NOTIFY=desktop
+EnvironmentFile=%h/.config/xiaomi-session-refresh/env
+# Applied after every other source, so neither the env file nor the user
+# manager's environment can make a manual retry back off.
+UnsetEnvironment=XQ_TIMER_RUN
 ExecStart=/usr/bin/env bun %h/.local/share/xiaomi-session-refresh/refresh-session.ts
 NoNewPrivileges=yes

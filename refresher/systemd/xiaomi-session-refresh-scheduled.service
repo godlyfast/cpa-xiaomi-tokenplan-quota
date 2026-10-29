@@ -1,0 +1,20 @@
+# Example user unit started only by xiaomi-session-refresh.timer (its Unit=).
+# Same as xiaomi-session-refresh.service (see its comments) except that
+# XQ_TIMER_RUN=1 marks these runs as the ones that back off. TRIGGER_UNIT is
+# not used for that: systemd.exec(5) calls it best-effort and lossy. To retry
+# by hand, start xiaomi-session-refresh.service, never this unit. No [Install]:
+# enable the timer.
+[Unit]
+Description=Renew the Xiaomi MiMo collector session (timer run, backs off)
+
+[Service]
+Type=oneshot
+TimeoutStartSec=180
+StateDirectory=xiaomi-session-refresh
+StateDirectoryMode=0700
+Environment=PATH=%h/.bun/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=%h/.config/xiaomi-session-refresh/env
+# Keep XQ_TIMER_RUN out of the env file: settings there override this line.
+Environment=XQ_TIMER_RUN=1
+ExecStart=/usr/bin/env bun %h/.local/share/xiaomi-session-refresh/refresh-session.ts
+NoNewPrivileges=yes
