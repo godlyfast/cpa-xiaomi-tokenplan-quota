@@ -27,7 +27,13 @@ Environment=XQ_CDP_URL=http://127.0.0.1:9223
 Environment=XQ_SSH_TARGET=user@collector-host.example
 Environment=XQ_REMOTE_DIR=/srv/xiaomi-quota/session
 Environment=XQ_COLLECTOR_CONTAINER=xiaomi-quota
-Environment="XQ_MANUAL_COMMAND=systemctl --user start xiaomi-session-refresh.service"
+# The timer activates this unit, so this unit's runs are the ones that back off.
+# TRIGGER_UNIT cannot tell them apart: it sticks on the unit after its first
+# timer start, so a manual `systemctl start` would inherit it. Mark the timer
+# run with an explicit env var, and keep the manual retry a direct `bun` run
+# (XQ_MANUAL_COMMAND) so it never carries XQ_TIMER_RUN and always bypasses backoff.
+Environment=XQ_TIMER_RUN=1
+Environment="XQ_MANUAL_COMMAND=bun %h/.local/share/xiaomi-session-refresh/refresh-session.ts"
 #Environment=XQ_HOST_LABEL=workstation
 # Optional: start the renewal browser when needed (refresher/examples), and a
 # desktop notification when a person is needed.

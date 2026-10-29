@@ -1808,7 +1808,7 @@ test("config: launcher path, notification mode and timer trigger", () => {
       ...ENV,
       XQ_BROWSER_LAUNCH: "/home/user/.local/share/xiaomi-session-refresh/launch browser.sh",
       XQ_NOTIFY: "desktop",
-      TRIGGER_UNIT: "xiaomi-session-refresh.timer",
+      XQ_TIMER_RUN: "1",
     },
     "h",
   );
@@ -1822,9 +1822,14 @@ test("config: launcher path, notification mode and timer trigger", () => {
     notify: "none",
   });
   expect(lib.parseConfig({ ...ENV, XQ_NOTIFY: "none" }, "h").notify).toBe("none");
-  // Manual systemctl start and direct runs have no TRIGGER_UNIT.
-  for (const trigger of [undefined, "", "xiaomi-session-refresh.service", "x.timer.service", "timer"])
-    expect(lib.parseConfig({ ...ENV, TRIGGER_UNIT: trigger }, "h").timerRun).toBe(false);
+  // Only the timer-triggered unit sets XQ_TIMER_RUN=1. The manual `bun` retry
+  // and a leftover TRIGGER_UNIT (which sticks on the unit after its first timer
+  // start) must never count as a timer run.
+  for (const v of [undefined, "", "0", "2", "true", "01", " 1"])
+    expect(lib.parseConfig({ ...ENV, XQ_TIMER_RUN: v }, "h").timerRun).toBe(false);
+  expect(
+    lib.parseConfig({ ...ENV, TRIGGER_UNIT: "xiaomi-session-refresh.timer" }, "h").timerRun,
+  ).toBe(false);
 });
 
 test("launcher runner: argv only, closed stdin, allowlisted env, timeout and use-time file checks", async () => {
@@ -2613,6 +2618,88 @@ test("run lock: one run at a time, released on any exit; --check needs no lock",
   }
 }, 30000);
 
+// A port nothing listens on, so the discovery probe is "refused" and the launcher's --check runs.
+async function closedPort(): Promise<number> {
+  const s = createServer();
+  const port: number = await new Promise((resolve) =>
+    s.listen(0, "127.0.0.1", () => resolve((s.address() as { port: number }).port)),
+  );
+  await new Promise<void>((resolve) => s.close(() => resolve()));
+  return port;
+}
+
+// The entrypoint must wire the real state store, launcher and notifier into runRefresh.
+// Dropping any one of those lines leaves every injected-double test green, so exercise them
+// through a full spawn: launcher --check, a 0600 state file, and one notify on browser_unavailable.
+test("entrypoint: wires state store, launcher and notifier into a full run", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "xq-wire-"));
+  try {
+    const runtime = join(dir, "run");
+    await mkdir(runtime);
+    // Fake ssh: the status read (no 'sudo') prints a healthy collector; nothing is pushed.
+    await writeFile(
+      join(dir, "ssh"),
+      `#!/bin/sh\ncat > /dev/null\nprintf '%s\\n' '${collector(null)}'\n`,
+      { mode: 0o700 },
+    );
+    // Launcher records its argv; --check exit code is read from $dir/check-exit (default 0).
+    await writeFile(join(dir, "check-exit"), "0");
+    const launcher = join(dir, "launch.sh");
+    await writeFile(
+      launcher,
+      `#!/bin/sh\nprintf '%s\\n' "$*" >> "${dir}/launch-argv"\n[ "$1" = --check ] && exit "$(cat "${dir}/check-exit")"\nexit 0\n`,
+      { mode: 0o700 },
+    );
+    // notify-send stub on PATH records one line per call.
+    await writeFile(
+      join(dir, "notify-send"),
+      `#!/bin/sh\necho notify >> "${dir}/notifies"\n`,
+      { mode: 0o700 },
+    );
+    const stateFile = join(dir, ".local", "state", "xiaomi-session-refresh", "state.json");
+    const env = {
+      PATH: dir + ":" + process.env.PATH,
+      HOME: dir,
+      XDG_RUNTIME_DIR: runtime,
+      ...ENV,
+      XQ_CDP_URL: "http://127.0.0.1:" + (await closedPort()),
+      XQ_BROWSER_LAUNCH: launcher,
+      XQ_NOTIFY: "desktop",
+    };
+    const spawn = () =>
+      Bun.spawn([process.execPath, join(import.meta.dir, "refresh-session.ts")], { env, stdout: "pipe", stderr: "pipe" });
+
+    // Healthy collector, port refused, launcher --check exits 0: not_needed, browser startable.
+    let p = spawn();
+    expect(await p.exited).toBe(0);
+    expect(await new Response(p.stdout).text()).toBe(
+      "xiaomi-session-refresh: not_needed (collector ok; renewal browser not running but can be started)\n",
+    );
+    expect(await new Response(p.stderr).text()).toBe("");
+    // Launcher was called, and only with --check (no bare start on a healthy run).
+    expect((await readFile(join(dir, "launch-argv"), "utf8")).trim().split("\n")).toEqual(["--check"]);
+    // State was written by fileStateStore, 0600, and parses.
+    expect(await modeOf(stateFile)).toBe(0o600);
+    expect(await modeOf(join(dir, ".local", "state", "xiaomi-session-refresh"))).toBe(0o700);
+    expect(lib.parseState(await readFile(stateFile, "utf8"))!.last).toBe("not_needed");
+    // not_needed is not a needs-a-person result: no notification.
+    expect(existsSync(join(dir, "notifies"))).toBe(false);
+
+    // Now --check fails: browser_unavailable, which needs a person, so exactly one notify fires.
+    await writeFile(join(dir, "check-exit"), "4");
+    p = spawn();
+    expect(await p.exited).toBe(1);
+    expect(await new Response(p.stdout).text()).toBe("");
+    expect(await new Response(p.stderr).text()).toBe(
+      "xiaomi-session-refresh: browser_unavailable (renewal browser not running and cannot be started; collector ok)\n",
+    );
+    expect(lib.parseState(await readFile(stateFile, "utf8"))!.notified).toBe("browser_unavailable");
+    expect((await readFile(join(dir, "notifies"), "utf8")).trim().split("\n")).toEqual(["notify"]);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}, 30000);
+
 test("remote writer: a rename between reading and sizing the installed session cannot fail push", async () => {
   await sessionDir(async (dir, root) => {
     const file = join(dir, "mimo_session");
@@ -2764,6 +2851,19 @@ test("example launcher: exact Hyprland dispatch, Exec-line sanitizing and --chec
       expect({ exec, code: (await sh(["--check"])).code === 0 }).toEqual({ exec, code: false });
       expect((await recorded()).filter((c) => c[0] === "dispatch")).toEqual([]);
     }
+    // A valid Exec in a [Desktop Action] group, but none in [Desktop Entry], must be
+    // ignored: only the main group's Exec is read. (Without the group restriction a
+    // first-match grep would dispatch the action's command.)
+    await reset();
+    await writeFile(
+      join(apps, "google-chrome-agents.desktop"),
+      "[Desktop Entry]\nType=Application\nName=No main Exec\n#Exec=/usr/bin/commented-out\n" +
+        "[Desktop Action new-window]\nName=New Window\n" +
+        "Exec=/usr/bin/action-browser --user-data-dir=/home/user/p --class=xq-renewal\n",
+    );
+    expect((await sh([])).code === 0).toBe(false);
+    expect((await sh(["--check"])).code === 0).toBe(false);
+    expect((await recorded()).filter((c) => c[0] === "dispatch")).toEqual([]);
     // Missing entry; bad arguments.
     await reset();
     await rm(join(apps, "google-chrome-agents.desktop"));

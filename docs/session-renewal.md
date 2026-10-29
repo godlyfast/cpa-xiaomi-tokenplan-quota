@@ -112,11 +112,11 @@ The console wait (step 4) ends **loaded** when the tab's own `GET …/tokenPlan/
 
 ## Backoff
 
-Only **timer-triggered** runs back off. systemd 251 and later set `TRIGGER_UNIT` for a service started by a timer; a run counts as timer-triggered if and only if `TRIGGER_UNIT` ends with `.timer`. A manual `systemctl --user start xiaomi-session-refresh.service`, a direct `bun` run and `--force` always bypass backoff.
+Only **timer-triggered** runs back off. The timer activates `xiaomi-session-refresh.service`, which sets `XQ_TIMER_RUN=1`; a run counts as timer-triggered if and only if that variable is `1`. `TRIGGER_UNIT` is not used: systemd keeps a unit's activation details after its first timer start, so a later manual `systemctl --user start` of the same unit inherits `TRIGGER_UNIT=…​.timer`. `XQ_MANUAL_COMMAND` is therefore a direct `bun …/refresh-session.ts` run, which carries no `XQ_TIMER_RUN` and always bypasses backoff, as do any direct `bun` run and `--force`.
 
 - **Which results:** after `signin_required`, `account_mismatch` or a vendor change, the next browser-path attempt waits min(60, 15 × 2^(n−1)) minutes after the last attempt, n being the number of consecutive runs with that result: 15, 30, 60, 60, … minutes. `browser_unavailable`, `vendor_unavailable`, `collector_unreachable` and other `error` results never back off.
 - **Bypass on change:** a run attempts again as soon as the collector's `session.rejectedAt` or `session.updatedAt` differs from the values recorded at the last attempt (a new rejection or a replaced file).
-- **A backed-off run** does no browser, Xiaomi or push work. It rewrites the last failure result to the status file (fresh `checkedAt`, so the page keeps the same advice and does not go stale), exits with that result's exit code and logs, for example: `signin_required (backing off until 21:45Z after 2 attempts; run "systemctl --user start xiaomi-session-refresh.service" to retry now; collector auth_required since …)`. It does not count as an attempt.
+- **A backed-off run** does no browser, Xiaomi or push work. It rewrites the last failure result to the status file (fresh `checkedAt`, so the page keeps the same advice and does not go stale), exits with that result's exit code and logs, for example: `signin_required (backing off until 21:45Z after 2 attempts; run "bun ~/.local/share/xiaomi-session-refresh/refresh-session.ts" to retry now; collector auth_required since …)`. It does not count as an attempt.
 - After signing in again, run the manual command instead of waiting.
 
 ## Run state and lock
@@ -164,7 +164,7 @@ Environment only; no configuration file. Invalid values stop the run with exit 1
 
 Empty `XQ_CDP_URL`, `XQ_HOST_LABEL`, `XQ_MANUAL_COMMAND`, `XQ_BROWSER_LAUNCH` or `XQ_NOTIFY` means unset. Flags: `--check`, `--force` and `--rebind`; anything else is a usage error (exit 1).
 
-The refresher also reads, without validation errors: `TRIGGER_UNIT` (set by systemd for timer runs; [backoff](#backoff)), `STATE_DIRECTORY`, `XDG_STATE_HOME` and `HOME` (state directory; a value that is not absolute is ignored) and `XDG_RUNTIME_DIR` (run lock).
+The refresher also reads, without validation errors: `XQ_TIMER_RUN` (`1` only in the timer-activated unit; [backoff](#backoff)), `STATE_DIRECTORY`, `XDG_STATE_HOME` and `HOME` (state directory; a value that is not absolute is ignored) and `XDG_RUNTIME_DIR` (run lock).
 
 Timeouts and URLs are fixed:
 
@@ -251,7 +251,7 @@ Without step 3, a v0.3.0 collector keeps serving the last report. After 15 minut
 
 ## Operation
 
-Manual run with the same environment: `systemctl --user start xiaomi-session-refresh.service`, or `bun ~/.local/share/xiaomi-session-refresh/refresh-session.ts [--check] [--force] [--rebind]`.
+Manual run with the same environment: `bun ~/.local/share/xiaomi-session-refresh/refresh-session.ts [--check] [--force] [--rebind]` (this is `XQ_MANUAL_COMMAND`, and it bypasses backoff). A `systemctl --user start xiaomi-session-refresh.service` runs the same way but counts as a timer run (it sets `XQ_TIMER_RUN=1` and inherits any `TRIGGER_UNIT`), so after a needs-a-person failure it may back off; prefer the direct `bun` run to retry now.
 
 - `--check` reads the collector status and prints the decision and the renewal browser's readiness (discovery endpoint, else `launcher --check`): no tab, no Xiaomi request, no write, no run lock.
 - `--force` renews even when the collector is healthy. A healthy collector reads the replaced file on its next 5-minute poll; a blocked one within the session-check interval. It is the only way to exercise the browser path while the collector is healthy.

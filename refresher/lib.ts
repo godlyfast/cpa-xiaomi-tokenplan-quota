@@ -75,7 +75,10 @@ export interface Config {
   // Launcher that can start the renewal browser; null keeps v0.3.0 behaviour.
   browserLaunch: string | null;
   notify: "desktop" | "none";
-  // systemd 251+ sets TRIGGER_UNIT for timer-activated runs; only those back off.
+  // The timer-triggered unit sets XQ_TIMER_RUN=1; only those runs back off.
+  // (TRIGGER_UNIT sticks on a unit after its first timer start, so a manual
+  // `systemctl start` of that unit would inherit it; an explicit env is the
+  // only reliable split, and the manual command is a direct `bun` run.)
   timerRun: boolean;
 }
 export interface Flags {
@@ -175,7 +178,7 @@ export function parseConfig(
     manualCommand,
     browserLaunch,
     notify,
-    timerRun: (env.TRIGGER_UNIT ?? "").endsWith(".timer"),
+    timerRun: env.XQ_TIMER_RUN === "1",
   };
 }
 
