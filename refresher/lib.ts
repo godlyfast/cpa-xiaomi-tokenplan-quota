@@ -324,6 +324,9 @@ const pickEnv = (
 };
 const MAX_STDOUT = 65536;
 const MAX_STDERR = 4096;
+// After ssh exits, what it wrote is already buffered: a pipe that a descendant (a
+// ProxyCommand helper, a wrapper) keeps open must not hold the call past this.
+export const DRAIN_MS = 250;
 export function spawnRunner(
   options: { binary?: string; env?: Record<string, string | undefined> } = {},
 ): SshRunner {
@@ -336,13 +339,29 @@ export function spawnRunner(
       stderr: keepStderr ? "pipe" : "ignore",
       env,
     });
-    let timedOut = false;
+    const out = proc.stdout.getReader();
+    const err =
+      proc.stderr instanceof ReadableStream
+        ? (proc.stderr as ReadableStream<Uint8Array>).getReader()
+        : null;
+    let timedOut = false,
+      drained = false,
+      drain: ReturnType<typeof setTimeout> | undefined;
     const timer = setTimeout(() => {
-      // Exited already (stderr still draining): its own exit code stands.
+      // Exited already (pipes still draining): its own exit code stands.
       if (proc.exitCode !== null || proc.signalCode !== null) return;
       timedOut = true;
       proc.kill("SIGKILL");
     }, timeoutMs);
+    // Exit (or the kill) ends the call within DRAIN_MS, whoever still holds a pipe.
+    const exited = proc.exited.then((code) => {
+      drain = setTimeout(() => {
+        drained = true;
+        void out.cancel().catch(() => undefined);
+        void err?.cancel().catch(() => undefined);
+      }, DRAIN_MS);
+      return code;
+    });
     try {
       try {
         if (stdin !== null) proc.stdin.write(stdin);
@@ -355,21 +374,21 @@ export function spawnRunner(
       let total = 0,
         over = false;
       const read = async () => {
-        const reader = proc.stdout.getReader();
         try {
           while (true) {
-            const { value, done } = await reader.read();
+            const { value, done } = await out.read();
             if (done) return;
             total += value.byteLength;
             if (total > MAX_STDOUT) {
               over = true;
               proc.kill("SIGKILL");
-              await reader.cancel().catch(() => undefined);
+              await out.cancel().catch(() => undefined);
               return;
             }
             chunks.push(value);
           }
         } catch {
+          if (drained) return;
           over = true;
           proc.kill("SIGKILL");
         }
@@ -378,11 +397,10 @@ export function spawnRunner(
       const kept: Uint8Array[] = [];
       let keptBytes = 0;
       const readErr = async () => {
-        if (!(proc.stderr instanceof ReadableStream)) return;
-        const reader = (proc.stderr as ReadableStream<Uint8Array>).getReader();
+        if (!err) return;
         try {
           while (true) {
-            const { value, done } = await reader.read();
+            const { value, done } = await err.read();
             if (done) return;
             if (keptBytes < MAX_STDERR) {
               const part = value.subarray(0, MAX_STDERR - keptBytes);
@@ -394,7 +412,7 @@ export function spawnRunner(
           // The exit code still reports the failure.
         }
       };
-      const [, , code] = await Promise.all([read(), readErr(), proc.exited]);
+      const [, , code] = await Promise.all([read(), readErr(), exited]);
       if (over) return { code: OVERSIZED, stdout: "" };
       if (timedOut) return { code: TIMED_OUT, stdout: "" };
       return {
@@ -404,6 +422,7 @@ export function spawnRunner(
       };
     } finally {
       clearTimeout(timer);
+      clearTimeout(drain);
     }
   };
 }
@@ -527,6 +546,8 @@ export interface CdpClient {
   ): Promise<Record<string, unknown>>;
   onEvent(listener: (event: CdpEvent) => void): () => void;
   readonly closed: Promise<void>;
+  // The <id> of /devtools/browser/<id>: new for every browser process.
+  readonly browserId: string;
   close(): void;
 }
 type Fetcher = (input: string, init: RequestInit) => Promise<Response>;
@@ -543,7 +564,7 @@ export async function connectBrowser(
   // One budget for discovery and socket open together.
   const timeoutMs = options.timeoutMs ?? 3000,
     end = Date.now() + timeoutMs;
-  let path: string;
+  let path: string, browserId: string;
   try {
     const response = await (options.fetch ?? fetch)(origin + "/json/version", {
       method: "GET",
@@ -566,6 +587,7 @@ export async function connectBrowser(
     )
       throw new BrowserUnavailable();
     path = ws.pathname;
+    browserId = path.slice("/devtools/browser/".length);
   } catch {
     throw new BrowserUnavailable();
   }
@@ -650,6 +672,7 @@ export async function connectBrowser(
   });
   return {
     closed,
+    browserId,
     send(method, params = {}, sessionId, ms) {
       if (isClosed) return Promise.reject(new BrowserUnavailable());
       const id = ++nextId;
@@ -679,12 +702,17 @@ export async function connectBrowser(
     },
   };
 }
-// Discovery only: true when <origin>/json/version answers 200. No socket, tab or cookie.
+// Discovery only, no socket, tab or cookie: "up" when <origin>/json/version answers 200,
+// "refused" when nothing listens on the port, "unknown" for anything else (a timeout, another
+// status): a busy browser is not a stopped one.
+export type ProbeState = "up" | "refused" | "unknown";
+// Bun 1.3 reports a refused connection as ConnectionRefused, 1.4 as ECONNREFUSED.
+const REFUSED = new Set(["ECONNREFUSED", "ConnectionRefused"]);
 export async function probeBrowser(
   origin: string,
   timeoutMs: number,
   options: { fetch?: Fetcher; signal?: AbortSignal } = {},
-): Promise<boolean> {
+): Promise<ProbeState> {
   const timeout = AbortSignal.timeout(timeoutMs);
   try {
     const response = await (options.fetch ?? fetch)(origin + "/json/version", {
@@ -693,9 +721,10 @@ export async function probeBrowser(
       signal: options.signal ? AbortSignal.any([timeout, options.signal]) : timeout,
     });
     await response.body?.cancel().catch(() => undefined);
-    return response.status === 200;
-  } catch {
-    return false;
+    return response.status === 200 ? "up" : "unknown";
+  } catch (error) {
+    const code = record(error) ? error.code : undefined;
+    return typeof code === "string" && REFUSED.has(code) ? "refused" : "unknown";
   }
 }
 
@@ -1374,8 +1403,8 @@ export function notice(
 export interface Deps {
   ssh: SshRunner;
   connectBrowser: (origin: string, timeoutMs: number) => Promise<CdpClient>;
-  // GET <origin>/json/version answered 200 (loopback discovery only).
-  probe: (origin: string, timeoutMs: number) => Promise<boolean>;
+  // GET <origin>/json/version (loopback discovery only).
+  probe: (origin: string, timeoutMs: number) => Promise<ProbeState>;
   fetch: Fetcher;
   now: () => Date;
   // Used only when XQ_BROWSER_LAUNCH is set.
@@ -1410,6 +1439,7 @@ const exitCode = (r: RenewalResult): 0 | 1 | 2 | 3 =>
 const statusResult = (k: Kind): RenewalResult => (k === "vendor_changed" ? "error" : k);
 const UNUSABLE = "installed session file missing or unusable; reinstall with --rebind";
 const RUNNING = "renewal browser running";
+const NOT_ANSWERING = "renewal browser not answering";
 const STARTABLE = "renewal browser not running but can be started";
 const sleep = (ms: number, signal?: AbortSignal) =>
   new Promise<void>((resolve) => {
@@ -1457,9 +1487,12 @@ export async function runRefresh(
       ? "collector ok"
       : "collector " + s.error + (s.rejectedAt && s.error === "auth_required" ? " since " + s.rejectedAt : ""));
   const launcher = cfg.browserLaunch !== null ? deps.launcher : undefined;
-  // Discovery endpoint first, then the launcher's side-effect-free --check.
+  // Discovery endpoint first, then the launcher's side-effect-free --check. Only a refused
+  // port counts as stopped: a renewal never launches over a browser that is merely slow.
   async function readiness(): Promise<{ ok: boolean; text: string; detail?: string }> {
-    if (await deps.probe(cfg.cdpOrigin, run.budget(t.connectMs))) return { ok: true, text: RUNNING };
+    const probe = await deps.probe(cfg.cdpOrigin, run.budget(t.connectMs));
+    if (probe === "up") return { ok: true, text: RUNNING };
+    if (probe === "unknown") return { ok: false, text: NOT_ANSWERING };
     if (!launcher) return { ok: false, text: "renewal browser not running; no launcher configured" };
     if (deps.signal?.aborted) return { ok: false, text: INTERRUPTED };
     const r = await launcher(true, run.budget(t.launcherMs), run.signal);
@@ -1578,14 +1611,17 @@ export async function runRefresh(
     while (!stopped(run)) {
       const left = end - performance.now();
       if (left <= 0) return false;
-      if (await deps.probe(cfg.cdpOrigin, Math.max(1, Math.min(t.connectMs, left)))) return true;
+      if ((await deps.probe(cfg.cdpOrigin, Math.max(1, Math.min(t.connectMs, left)))) === "up")
+        return true;
       const pause = Math.min(t.pollMs, end - performance.now());
       if (pause > 0) await sleep(pause, run.signal);
     }
     return false;
   }
   // Best effort within browserCloseMs: Browser.close on the run's browser-level
-  // connection, or on one fresh connection if that one is gone or was never opened.
+  // connection, or on one fresh connection if that one is gone or was never opened. After a
+  // lost connection only the same browser process (same browser id) is closed: whatever
+  // answers the port by then may be a browser someone else started.
   async function closeStarted(client: CdpClient | null, lost: boolean) {
     const end = performance.now() + t.browserCloseMs;
     const left = () => Math.max(1, end - performance.now());
@@ -1596,6 +1632,7 @@ export async function runRefresh(
     let fresh: CdpClient | null = null;
     try {
       fresh = await deps.connectBrowser(cfg.cdpOrigin, Math.min(t.connectMs, left()));
+      if (client && fresh.browserId !== client.browserId) return;
       await fresh.send("Browser.close", {}, undefined, left());
     } catch {
       // Nothing more to do within the bound.
@@ -1608,8 +1645,11 @@ export async function runRefresh(
       client: CdpClient | null = null,
       lost = false;
     try {
-      // Without a launcher this is v0.3.0: connect directly.
-      if (launcher && !(await deps.probe(cfg.cdpOrigin, run.budget(t.connectMs)))) {
+      // Without a launcher this is v0.3.0: connect directly. With one, launch only when
+      // nothing listens: a busy browser would take the start request over and then be closed
+      // as this run's own. Before a starting browser opens its port, the launcher must refuse
+      // while the profile is in use (the example does).
+      if (launcher && (await deps.probe(cfg.cdpOrigin, run.budget(t.connectMs))) === "refused") {
         let stop = stopped(run);
         if (stop) return { result: "error", reason: stop };
         const r = await launcher(false, run.budget(t.launcherMs), run.signal);

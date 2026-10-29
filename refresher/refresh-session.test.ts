@@ -11,7 +11,8 @@ import {
   chmod,
 } from "node:fs/promises";
 import { existsSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { createServer } from "node:net";
+import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import * as lib from "./lib";
 
@@ -239,6 +240,8 @@ interface Script {
   // Answers this command late (after ms), like a slow browser.
   delay?: { method: string; ms: number };
   onCookies?: () => void;
+  // The browser process's DevTools id; another id is another browser.
+  browserId?: string;
 }
 class FakeCdp implements lib.CdpClient {
   sent: { method: string; params: Record<string, unknown>; sessionId?: string }[] = [];
@@ -248,7 +251,10 @@ class FakeCdp implements lib.CdpClient {
   private listeners = new Set<(e: lib.CdpEvent) => void>();
   private markClosed!: () => void;
   readonly closed = new Promise<void>((resolve) => (this.markClosed = resolve));
-  constructor(private script: Script = {}) {}
+  readonly browserId: string;
+  constructor(private script: Script = {}) {
+    this.browserId = script.browserId ?? "B-SYNTHETIC";
+  }
   emit: Emit = (e) => {
     for (const listener of [...this.listeners]) listener(e);
   };
@@ -355,8 +361,10 @@ async function run(
     cfg?: lib.Config;
     t?: lib.Timeouts;
     signal?: AbortSignal;
-    // Discovery endpoint; defaults to "up unless cdp is down".
-    probe?: (origin: string, ms: number) => Promise<boolean>;
+    // Discovery endpoint; defaults to "up unless cdp is down" (then refused).
+    probe?: (origin: string, ms: number) => Promise<lib.ProbeState>;
+    // Returned by every connect after the first (default: cdp again).
+    reconnect?: FakeCdp;
     launcher?: lib.Launcher;
     notify?: lib.Notifier;
     state?: lib.StateStore;
@@ -380,14 +388,14 @@ async function run(
         expect(ms).toBeGreaterThan(0);
         expect(ms).toBeLessThanOrEqual(t.connectMs);
         if (cdp === "down") throw new lib.BrowserUnavailable();
-        return cdp;
+        return connects > 1 && o.reconnect ? o.reconnect : cdp;
       },
       probe: async (origin, ms) => {
         probes++;
         expect(origin).toBe("http://127.0.0.1:9223");
         expect(ms).toBeGreaterThan(0);
         expect(ms).toBeLessThanOrEqual(t.connectMs);
-        return o.probe ? o.probe(origin, ms) : cdp !== "down";
+        return o.probe ? o.probe(origin, ms) : cdp !== "down" ? "up" : "refused";
       },
       fetch: fetcher.f,
       now: o.now ?? (() => NOW),
@@ -1177,6 +1185,8 @@ test("CDP client: correlates replies, routes session events, fails closed on los
   });
   try {
     const client = await lib.connectBrowser(fake.origin);
+    // The browser process's id, from the discovery endpoint's /devtools/browser/<id>.
+    expect(client.browserId).toBe("synthetic-0001");
     const events: lib.CdpEvent[] = [];
     const off = client.onEvent((e) => events.push(e));
     expect(await client.send("Synthetic.echo", { a: 1 }, "S-1")).toEqual({ echoed: { a: 1 }, sessionId: "S-1" });
@@ -1275,14 +1285,19 @@ test("end to end over a synthetic DevTools socket: renewed, owned target closed"
 test("entrypoint refuses invalid configuration before any I/O", async () => {
   const home = await mkdtemp(join(tmpdir(), "xq-entry-"));
   try {
-    for (const [args, env, message] of [
-      [["--bogus"], ENV, "usage:"],
-      [[], { ...ENV, XQ_SSH_TARGET: "user@host;id" }, "XQ_SSH_TARGET"],
-      [[], { ...ENV, XQ_CDP_URL: "http://192.0.2.10:9223" }, "XQ_CDP_URL"],
-      [["--check"], { XQ_REMOTE_DIR: "/srv/x" }, "XQ_SSH_TARGET"],
+    const runtime = join(home, "run");
+    await mkdir(runtime);
+    for (const [args, env, message, rejected] of [
+      [["--bogus"], ENV, "usage:", "--bogus"],
+      [[], { ...ENV, XQ_SSH_TARGET: "user@host;id" }, "XQ_SSH_TARGET", "host;id"],
+      [[], { ...ENV, XQ_CDP_URL: "http://192.0.2.10:9223" }, "XQ_CDP_URL", "192.0.2.10"],
+      [["--check"], { XQ_REMOTE_DIR: "/srv/x" }, "XQ_SSH_TARGET", "/srv/x"],
+      [[], { ...ENV, XQ_BROWSER_LAUNCH: "relative/launch-browser" }, "XQ_BROWSER_LAUNCH", "relative/launch-browser"],
+      [["--force"], { ...ENV, XQ_BROWSER_LAUNCH: "/synthetic/launch\u0007bell" }, "XQ_BROWSER_LAUNCH", "bell"],
+      [[], { ...ENV, XQ_NOTIFY: "email" }, "XQ_NOTIFY", "email"],
     ] as const) {
       const p = Bun.spawn([process.execPath, join(import.meta.dir, "refresh-session.ts"), ...args], {
-        env: { PATH: process.env.PATH!, HOME: home, ...env },
+        env: { PATH: process.env.PATH!, HOME: home, XDG_RUNTIME_DIR: runtime, ...env },
         stdout: "pipe",
         stderr: "pipe",
       });
@@ -1291,7 +1306,11 @@ test("entrypoint refuses invalid configuration before any I/O", async () => {
       const err = await new Response(p.stderr).text();
       expect(err).toStartWith("xiaomi-session-refresh: invalid configuration: ");
       expect(err).toContain(message);
+      expect(err).not.toContain(rejected);
       expect(err.trim().split("\n").length).toBe(1);
+      // Before the run lock and the state directory: nothing created (.bun is Bun's own cache).
+      expect(await readdir(runtime)).toEqual([]);
+      expect((await readdir(home)).filter((name) => name !== ".bun")).toEqual(["run"]);
     }
   } finally {
     await rm(home, { recursive: true, force: true });
@@ -1484,6 +1503,49 @@ test("spawn runner: stdout over 64 KiB kills ssh at once instead of buffering", 
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("spawn runner: a descendant that keeps stdout or stderr open cannot hold the call", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "xq-drain-"));
+  try {
+    // Like a ProxyCommand helper or wrapper left running: it inherits both pipes and
+    // outlives ssh by far.
+    const helper = `(sleep 8 </dev/null & echo $! >> "${dir}/pids")`;
+    const exits = join(dir, "exits");
+    await writeFile(exits, `#!/bin/sh
+echo partial-out
+echo 'sudo: a password is required' >&2
+${helper}
+exit 255
+`, { mode: 0o700 });
+    for (const keepStderr of [true, false]) {
+      const started = Date.now();
+      const r = await lib.spawnRunner({ binary: exits })(["ssh"], null, 5000, keepStderr);
+      expect(Date.now() - started).toBeLessThan(lib.DRAIN_MS + 1500);
+      expect(r.code).toBe(255);
+      expect(r.stdout).toBe("partial-out\n");
+      if (keepStderr) expect(lib.collectorCause(r)).toBe("ssh failed");
+      if (keepStderr) expect(r.stderr).toBe("sudo: a password is required\n");
+    }
+    // Killed at the timeout while the helper still holds the pipes: bounded as well.
+    const hangs = join(dir, "hangs");
+    await writeFile(hangs, `#!/bin/sh
+${helper}
+exec sleep 30
+`, { mode: 0o700 });
+    const started = Date.now();
+    const r = await lib.spawnRunner({ binary: hangs })(["ssh"], null, 300, true);
+    expect(r).toEqual({ code: lib.TIMED_OUT, stdout: "" });
+    expect(Date.now() - started).toBeLessThan(300 + lib.DRAIN_MS + 1500);
+  } finally {
+    for (const pid of (await readFile(join(dir, "pids"), "utf8").catch(() => "")).split("\n").filter(Boolean))
+      try {
+        process.kill(Number(pid), "SIGKILL");
+      } catch {
+        // Already gone.
+      }
+    await rm(dir, { recursive: true, force: true });
+  }
+}, 20000);
 
 test("readiness expression: boolean only, same-origin usage URL with status 200", () => {
   const ready = (entries: unknown, type = "resource") =>
@@ -1711,6 +1773,8 @@ function fakeBrowser(
     check?: lib.LocalResult | "unsafe";
     // Discovery probes after the start request before the endpoint answers; null = never.
     upAfter?: number | null;
+    // The first n probes time out (a busy browser, or one still starting).
+    unknownFor?: number;
     onStart?: () => void;
   } = {},
 ) {
@@ -1718,10 +1782,12 @@ function fakeBrowser(
     running: o.running ?? false,
     launches: [] as { check: boolean; timeoutMs: number }[],
     sinceStart: -1,
+    probes: 0,
   };
-  const probe = async () => {
+  const probe = async (): Promise<lib.ProbeState> => {
+    if (++b.probes <= (o.unknownFor ?? 0)) return "unknown";
     if (b.sinceStart >= 0 && o.upAfter !== null && ++b.sinceStart > (o.upAfter ?? 2)) b.running = true;
-    return b.running;
+    return b.running ? "up" : "refused";
   };
   const launcher: lib.Launcher = async (check, timeoutMs) => {
     b.launches.push({ check, timeoutMs });
@@ -1846,12 +1912,62 @@ test("launch: a stopped browser is started, polled for, used and closed with Bro
   const signin = await run({ cfg: cfgL, probe: g.probe, launcher: g.launcher, cdp: signinCdp() });
   expect(signin.out.code).toBe(2);
   expectOwnedOnly(signin.cdp as FakeCdp, true);
-  // Connection lost mid-run: one fresh browser-level connection carries Browser.close.
+  // Connection lost mid-run: one fresh browser-level connection to the same browser
+  // process (same browser id) carries Browser.close.
   const h = fakeBrowser({ upAfter: 0 });
   const lost = await run({ cfg: cfgL, probe: h.probe, launcher: h.launcher, cdp: new FakeCdp({ onNavigate: (_, cdp) => cdp.drop() }) });
   expect(lost.out.line).toStartWith("xiaomi-session-refresh: browser_unavailable (browser connection lost;");
   expect(lost.connects).toBe(2);
   expect((lost.cdp as FakeCdp).sent.at(-1)).toEqual({ method: "Browser.close", params: {}, sessionId: undefined });
+  // Lost, and another browser process answers the port by then: not this run's, never closed.
+  const k = fakeBrowser({ upAfter: 0 });
+  const other = new FakeCdp({ browserId: "B-OTHER" });
+  const swapped = await run({
+    cfg: cfgL,
+    probe: k.probe,
+    launcher: k.launcher,
+    cdp: new FakeCdp({ onNavigate: (_, cdp) => cdp.drop() }),
+    reconnect: other,
+  });
+  expect(swapped.out.line).toStartWith("xiaomi-session-refresh: browser_unavailable (browser connection lost;");
+  expect(swapped.connects).toBe(2);
+  expect(other.sent).toEqual([]);
+  expect(other.socketClosed).toBe(true);
+  expect((swapped.cdp as FakeCdp).sent.filter((m) => m.method === "Browser.close")).toEqual([]);
+});
+
+test("launch: a running browser that answers discovery late is never started again or closed", async () => {
+  // The first probe times out while the browser runs (swap, session restore, still
+  // starting): no launch, the normal connect, and no Browser.close.
+  const since = "collector auth_required since " + REJECTED;
+  const f = fakeBrowser({ running: true, unknownFor: 1 });
+  const r = await run({ cfg: cfgL, probe: f.probe, launcher: f.launcher });
+  expect(r.out).toEqual({ code: 0, line: "xiaomi-session-refresh: renewed (" + since + ")" });
+  expect(f.b.launches).toEqual([]);
+  expect([r.probes, r.connects]).toEqual([1, 1]);
+  expectOwnedOnly(r.cdp as FakeCdp, false);
+  // The connect fails too: v0.3.0's browser_unavailable, still nothing launched or closed.
+  const g = fakeBrowser({ running: true, unknownFor: 99 });
+  const down = await run({ cfg: cfgL, probe: g.probe, launcher: g.launcher, cdp: "down" });
+  expect(down.out).toEqual({
+    code: 1,
+    line: "xiaomi-session-refresh: browser_unavailable (DevTools endpoint unreachable; " + since + ")",
+  });
+  expect(g.b.launches).toEqual([]);
+  expect([down.probes, down.connects]).toEqual([1, 1]);
+  // Healthy runs and --check report it as not answering, without the launcher's --check.
+  for (const check of [false, true]) {
+    const h = fakeBrowser({ running: true, unknownFor: 99 });
+    const x = await run({ cfg: cfgL, ssh: fakeSsh({ stdout: collector(null) }), probe: h.probe, launcher: h.launcher, flags: { check } });
+    expect(x.out).toEqual(
+      check
+        ? { code: 0, line: "xiaomi-session-refresh: check: not_needed (collector ok; renewal browser not answering)" }
+        : { code: 1, line: "xiaomi-session-refresh: browser_unavailable (renewal browser not answering; collector ok)" },
+    );
+    expect(h.b.launches).toEqual([]);
+    expect([x.probes, x.connects]).toEqual([1, 0]);
+    expect(x.written.map((w) => w.result)).toEqual(check ? [] : ["browser_unavailable"]);
+  }
 });
 
 test("launch: launcher failure or a browser that never comes up is browser_unavailable", async () => {
@@ -2210,7 +2326,7 @@ test("notify-send: direct argv, allowlisted environment, bounded; failures are f
   }
 });
 
-test("probe: discovery endpoint only; 200 means a browser is listening", async () => {
+test("probe: discovery endpoint only; up on 200, refused only when nothing listens", async () => {
   let status = 200,
     hang = false;
   const paths: string[] = [];
@@ -2226,22 +2342,41 @@ test("probe: discovery endpoint only; 200 means a browser is listening", async (
   });
   const origin = "http://127.0.0.1:" + server.port;
   try {
-    expect(await lib.probeBrowser(origin, 1000)).toBe(true);
+    expect(await lib.probeBrowser(origin, 1000)).toBe("up");
     expect(paths).toEqual(["/json/version"]);
-    for (status of [404, 500, 302]) expect(await lib.probeBrowser(origin, 1000)).toBe(false);
+    // Something answers, but not a browser ready for DevTools: never "stopped".
+    for (status of [404, 500, 302]) expect(await lib.probeBrowser(origin, 1000)).toBe("unknown");
     status = 200;
+    // Listening but too slow (a busy or still starting browser): unknown, not refused.
     hang = true;
     const started = Date.now();
-    expect(await lib.probeBrowser(origin, 200)).toBe(false);
+    expect(await lib.probeBrowser(origin, 200)).toBe("unknown");
     expect(Date.now() - started).toBeLessThan(1500);
     const ac = new AbortController();
     ac.abort();
     hang = false;
-    expect(await lib.probeBrowser(origin, 1000, { signal: ac.signal })).toBe(false);
+    expect(await lib.probeBrowser(origin, 1000, { signal: ac.signal })).toBe("unknown");
   } finally {
     server.stop(true);
   }
-  expect(await lib.probeBrowser(origin, 500)).toBe(false);
+  expect(await lib.probeBrowser(origin, 500)).toBe("refused");
+  // Accepts the connection, then drops it: unknown.
+  const reset = createServer((socket) => socket.destroy());
+  await new Promise<void>((resolve) => reset.listen(0, "127.0.0.1", resolve));
+  try {
+    const port = (reset.address() as { port: number }).port;
+    expect(await lib.probeBrowser("http://127.0.0.1:" + port, 1000)).toBe("unknown");
+  } finally {
+    reset.close();
+  }
+  // Transport errors other than a refusal are unknown too.
+  const fails = (code: unknown) => async () => {
+    throw Object.assign(new Error("synthetic"), { code });
+  };
+  expect(await lib.probeBrowser(origin, 500, { fetch: fails("ECONNREFUSED") })).toBe("refused");
+  expect(await lib.probeBrowser(origin, 500, { fetch: fails("ConnectionRefused") })).toBe("refused");
+  for (const code of ["ECONNRESET", "ETIMEDOUT", 111, undefined])
+    expect(await lib.probeBrowser(origin, 500, { fetch: fails(code) })).toBe("unknown");
 });
 
 test("backoff: timer runs wait 15, 30, 60, 60 min after repeated sign-in failures", async () => {
@@ -2464,8 +2599,9 @@ test("run lock: one run at a time, released on any exit; --check needs no lock",
       expect(existsSync(join(dir, "calls"))).toBe(false);
       p = spawn(["--check"]);
       expect(await p.exited).toBe(0);
+      // Something other than a DevTools endpoint answers the port (404): not a stopped browser.
       expect(await new Response(p.stdout).text()).toBe(
-        "xiaomi-session-refresh: check: not_needed (collector ok; renewal browser not running; no launcher configured)\n",
+        "xiaomi-session-refresh: check: not_needed (collector ok; renewal browser not answering)\n",
       );
       expect(await readFile(join(dir, "calls"), "utf8")).toBe("call\n");
       expect(existsSync(join(dir, ".local", "state", "xiaomi-session-refresh", "state.json"))).toBe(false);
@@ -2582,10 +2718,13 @@ test("example launcher: exact Hyprland dispatch, Exec-line sanitizing and --chec
     expect(await recorded()).toEqual([["version"]]);
     // Field codes anywhere are dropped; whitespace collapses.
     await reset();
-    await entry("Exec=/usr/bin/google-chrome-stable\t%F  --class=xq-renewal %u");
+    await entry("Exec=/usr/bin/google-chrome-stable\t%F  --user-data-dir=/home/user/p --class=xq-renewal %u");
     expect((await sh([])).code).toBe(0);
     expect(await recorded()).toEqual([
-      ["dispatch", 'hl.dsp.exec_cmd("/usr/bin/google-chrome-stable --class=xq-renewal", { workspace = "special:xiaomi-renewal silent" })'],
+      [
+        "dispatch",
+        'hl.dsp.exec_cmd("/usr/bin/google-chrome-stable --user-data-dir=/home/user/p --class=xq-renewal", { workspace = "special:xiaomi-renewal silent" })',
+      ],
     ]);
     // Hyprland must say "ok", and must be reachable for --check.
     for (const o of [{ out: "error: bad dispatch\n" }, { rc: "1" }, { out: "" }]) {
@@ -2611,6 +2750,13 @@ test("example launcher: exact Hyprland dispatch, Exec-line sanitizing and --chec
       "Exec=",
       "Exec=%U",
       "Name=No Exec in the main group",
+      // The profile must be named, absolutely (the last --user-data-dir counts, as in Chrome).
+      "Exec=/usr/bin/chrome --class=xq-renewal",
+      "Exec=/usr/bin/chrome --user-data-dir=relative/p",
+      "Exec=/usr/bin/chrome --user-data-dir=",
+      "Exec=/usr/bin/chrome --user-data-dir=/",
+      "Exec=/usr/bin/chrome --user-data-dir=/home/user/p --user-data-dir=relative/p",
+      "Exec=/usr/bin/chrome --user-data-dir /home/user/p",
     ]) {
       await reset();
       await entry(exec);
@@ -2632,11 +2778,14 @@ test("example launcher: exact Hyprland dispatch, Exec-line sanitizing and --chec
     await mkdir(join(root, ".local", "share", "applications"), { recursive: true });
     await writeFile(
       join(root, ".local", "share", "applications", "google-chrome-agents.desktop"),
-      "[Desktop Entry]\nExec=/usr/bin/fallback-browser --x=1\n",
+      "[Desktop Entry]\nExec=/usr/bin/fallback-browser --user-data-dir=/home/user/p --x=1\n",
     );
     expect((await sh([], { PATH: env.PATH, HOME: root })).code).toBe(0);
     expect(await recorded()).toEqual([
-      ["dispatch", 'hl.dsp.exec_cmd("/usr/bin/fallback-browser --x=1", { workspace = "special:xiaomi-renewal silent" })'],
+      [
+        "dispatch",
+        'hl.dsp.exec_cmd("/usr/bin/fallback-browser --user-data-dir=/home/user/p --x=1", { workspace = "special:xiaomi-renewal silent" })',
+      ],
     ]);
     // Through the refresher's own runner (use-time checks and env allowlist).
     await reset();
@@ -2647,6 +2796,49 @@ test("example launcher: exact Hyprland dispatch, Exec-line sanitizing and --chec
     expect(await launch(true, 5000)).toBe(0);
     expect(await launch(false, 5000)).toBe(0);
     expect(await recorded()).toEqual([["version"], ["dispatch", ...dispatch]]);
+    // A profile already in use (its SingletonLock names a live process on this host, as
+    // while Chrome starts or runs): exit 3 in both modes and nothing dispatched, so a
+    // running browser never receives the start and is never closed as this run's own.
+    const profile = join(root, "profile");
+    await mkdir(profile);
+    const own = "/usr/bin/google-chrome-stable --user-data-dir=" + profile + " --remote-debugging-port=9290";
+    await entry("Exec=" + own + " %U");
+    const lock = join(profile, "SingletonLock");
+    for (const [target, inUse] of [
+      [hostname() + "-" + process.pid, true],
+      ["other-host.example-" + process.pid, true],
+      ["unparsable", true],
+      [hostname() + "-", true],
+      // The process is gone: a stale lock that Chrome itself replaces.
+      [hostname() + "-2147483646", false],
+      [null, false],
+    ] as const) {
+      await reset();
+      await rm(lock, { force: true });
+      if (target !== null) await symlink(target, lock);
+      const check = await sh(["--check"]),
+        start = await sh([]);
+      expect({ target, check: check.code, start: start.code }).toEqual({
+        target,
+        check: inUse ? 3 : 0,
+        start: inUse ? 3 : 0,
+      });
+      expect(await recorded()).toEqual(
+        inUse
+          ? []
+          : [
+              ["version"],
+              ["dispatch", 'hl.dsp.exec_cmd("' + own + '", { workspace = "special:xiaomi-renewal silent" })'],
+            ],
+      );
+    }
+    // Through the refresher's runner the start is refused the same way.
+    await reset();
+    await rm(lock, { force: true });
+    await symlink(hostname() + "-" + process.pid, lock);
+    expect(await launch(true, 5000)).toBe(3);
+    expect(await launch(false, 5000)).toBe(3);
+    expect(await recorded()).toEqual([]);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
