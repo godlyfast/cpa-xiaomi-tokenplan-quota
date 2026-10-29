@@ -1,5 +1,53 @@
 # Verification receipts
 
+## v0.3.1 — 2026-10-29 (branch `feat/v0.3.1-refresher`)
+
+Refresher-only release on top of v0.3.0 (`6eaff9b`). Only what is listed here was run.
+
+### Scope
+
+Synthetic local checks, plus one launch check with a throwaway browser profile on the laptop. **No Xiaomi request, real session or cookie, ssh to a real host, collector-host, VM, Docker, production gateway or agents-browser access, and no change to the deployed refresher, its units or its state.** The agents browser (`127.0.0.1:9223`) and the personal browser were never contacted.
+
+### Automated evidence
+
+- Bun **1.3.14** (the pinned `packageManager`, from the local Bun package cache), `bun test`: **109 pass / 0 fail** across 8 files (29461 `expect()` calls): collector 15, mimo 10, credit 3, renewal-status 5, contract 2, main 1, refresher 53 and native page 20. The 21 new refresher tests are listed below; the contract test is unchanged.
+- `bun run type-check` (`tsc --noEmit`): pass. `bun run build`: pass (`main.js` 18.61 KB, unchanged collector).
+- Bun **1.4.3** (the laptop's production refresher runtime), `bun test refresher tests/contract.test.ts`: **55 pass / 0 fail**.
+- The refresher suite alone, three more runs on 1.3.14: 53 / 0 each (several tests are timing-based).
+- `systemd-analyze --user verify` on a scratch copy of the example service: no findings.
+- Go tests and the native integration test were **not** run: `native/` is unchanged since v0.3.0.
+
+New refresher coverage, by test name (synthetic dependencies unless stated):
+
+- **Config:** `XQ_BROWSER_LAUNCH`, `XQ_NOTIFY` and `TRIGGER_UNIT` parsing; refusal without echo of relative, `~`, control-character and over-long launcher paths and unknown notify modes; the entrypoint refuses them before any I/O.
+- **Launcher runner** (real processes): argv only, closed stdin, allowlisted environment (no `LD_LIBRARY_PATH`, `SSH_AUTH_SOCK` or `XQ_*`), exit codes, kill at the timeout and on abort, and refusal of a symlink, a group- or world-writable file, a non-executable file, a foreign owner, a missing path and a directory.
+- **Launch:** a stopped browser is started, the endpoint polled until it answers, the session read, and the browser closed with `Browser.close` after the owned tab, also after a sign-in failure and over a fresh connection when the first one was lost. Launcher exit/timeout/unsafe/spawn failure and an endpoint that never answers give the fixed `browser_unavailable` reasons; the wait never outlives the run deadline. Only a browser the run started is closed; without a launcher nothing is probed or started. An interrupt during the wait writes nothing.
+- **Early warning:** every branch (running; startable; `--check` failing or unsafe; no launcher; launcher passed but not configured) with no tab, no cookie and no Xiaomi request, and the exact status written.
+- **`--check`:** browser readiness in each variant, the missing-session verdict, `--rebind`, no writes and no state change.
+- **Notifications:** enter, repeat (nothing), change, transient failure (nothing), recovery after a renewal and after a healthy run, undelivered then retried, vendor-change and account-mismatch content, disabled mode; fixed wording and markup escaping; the real `notify-send` runner against a stub (argv, allowlisted environment, failure and timeout as `false`).
+- **Backoff:** the 15/30/60/60-minute schedule for timer runs with exact backed-off lines and fresh `checkedAt`; bypass for manual runs, `--force`, a changed `rejectedAt` or `updatedAt`, an attempt time in the future and no recorded attempt; `account_mismatch` and vendor change back off, `browser_unavailable`, `vendor_unavailable`, `error`, `not_needed` and `renewed` do not; generic advice without a manual command.
+- **Missing session:** `missing` and `invalid_file` (also with `--force` and with a non-auth error) give `account_mismatch` without browser or Xiaomi; `--rebind` renews in `rebind` mode.
+- **Vendor change:** loaded console with a missing cookie, and with HTTP 401 or body `code` 403 on validation, report `error (… (vendor change?))`; without a loaded wait the v0.3.0 `signin_required` results are unchanged.
+- **Collector unreachable:** each cause (ssh exit 255, timeout, spawn failure, exit 3, unparsable output, sudo patterns, container patterns, other exit codes, oversized output), the same in `--check`; the real runner keeps 4096 bytes of a 1 MB stderr and drains the rest.
+- **State file** (real files): 0700 directory, 0600 file, no temporary leftovers, an existing 0755 directory tightened, twelve corrupt or invalid contents, a symlink and a directory read as empty, an unwritable directory makes `save` return false; through a run, corrupt state causes no backoff and an unwritable one only appends `; state not saved`.
+- **Run lock** (real `flock` through `bun:ffi`): a second taker is busy; a holder killed with SIGKILL releases it; the entrypoint prints `busy (another run is in progress)` and exits 1 before any ssh call, while `--check` still runs without the lock.
+- **Writer race** (the real `WRITE_SH` under bash against a temporary directory): a stub `stat` renames a same-account session of another size into place exactly when the writer asks for the size; the push installs (exit 0). The same scenario against the v0.3.0 writer (`git show 6eaff9b:refresher/lib.ts`, run by a scratch script) exits 8, so the test detects the old race.
+- **Unit:** `TimeoutStartSec` exceeds the 120 s deadline plus tab close, `Browser.close`, final status write and notification by at least 15 s; `StateDirectory`, `StateDirectoryMode=0700`, `NoNewPrivileges` and `Type=oneshot` present; no `--rebind`/`--force` in `ExecStart`.
+- **Example launcher** (stub `hyprctl` on `PATH`, no Hyprland): the exact dispatch argument, field codes and whitespace, `[Desktop Action]` and comment lines ignored, `ok` required, `--check` without dispatch, fourteen refused `Exec=` lines (never dispatched, `--check` fails), missing entry, bad arguments, the `~/.local/share` fallback, and running it through the refresher's own launcher runner. Syntax checked with `sh -n` and `bash -n`; `dash` was not installed.
+
+### Launch check with a throwaway browser
+
+Hyprland **0.56.2** with the Lua config provider. A scratch desktop entry under a scratch `XDG_DATA_HOME` started `google-chrome-stable` with a new profile under the scratch directory and DevTools on `127.0.0.1:9295`; a copy of the example launcher with `id` set to that entry. Two transient `Type=oneshot` user units (`systemd-run --user --wait --collect`) ran scratch scripts that used this branch's `probeBrowser`, `launcherRunner` and `connectBrowser`; no tab was created and nothing was navigated.
+
+1. First unit: probe `false`, `launcher --check` exit 0, launcher start exit 0; the unit ended (`inactive`). Afterwards Chrome was still running, with Hyprland as its parent, in `app.slice/app-com.google.Chrome-<pid>.scope`; its only window was on `special:xiaomi-renewal`; the active window stayed the previously focused application. `Browser.close` over a browser-level connection replied, the endpoint stopped answering within 0.3 s, the process was gone and the special workspace disappeared.
+2. Second unit (the refresher's launch path): probe `false`, launcher exit 0, endpoint answering 275 ms later under the 250 ms poll, window on the special workspace without focus, `Browser.close` replied, endpoint gone, no scratch Chrome process left.
+
+The scratch profile was deleted afterwards. The legacy form `hyprctl dispatch exec '[workspace special:… silent] true'` failed on this provider with a Lua syntax error (exit 7).
+
+### Unverified
+
+The refresher entrypoint against a real browser and console (only the library's launch and close steps ran live); a real `notify-send` delivery (only a stub); real ssh, sudo, `docker exec` and a collector host; the installed units, `StateDirectory=` creation by systemd and `TRIGGER_UNIT` as set by a real timer; whether the console's usage request ever answers HTTP 200 with an authentication failure in the body (see the [vendor-change limitation](session-renewal.md#limitations)).
+
 ## v0.3.0 — 2026-10-28 (branch `feat/session-renewal`, code at `cecc085`)
 
 Refreshed after the round-1 review fixes (`93d2fef..cecc085`): account binding for renewals (`account_mismatch`, `--rebind`), no DevTools Network domain, a 100 s run deadline with SIGTERM/SIGINT tab cleanup, a streaming 64 KiB ssh stdout cap, stricter `XQ_REMOTE_DIR` spelling, strict printable-ASCII session files, `nextAttemptAt: null` for missing/unusable files, and the matching page and `quota.fetch` guidance.

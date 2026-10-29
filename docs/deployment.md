@@ -31,10 +31,22 @@ v0.2.x uses a single-file mount and halts after a rejection; the v0.3.0 collecto
 5. Verify the plugin page shows the session state (a v0.2.x collector produces the legacy guidance instead) and that with no refresher yet it reports no renewal agent.
 6. Optionally install the [refresher](session-renewal.md#installation) and, before enabling its timer, run its end-to-end smoke test: `--check`, then one run through the browser. `--check` and a normal run against a healthy collector never touch the browser, so they cannot catch a wrong `XQ_CDP_URL`, a stopped or signed-out browser, or changed cookie names. If the copied session holds exactly one `userId` of the bound account, run `--force` and require `renewed (forced; collector ok)`. If it has no single `userId`, or this is a first install or an account switch, run `--force --rebind` instead (`--rebind` alone if the collector already reports `auth_required`). Require `renewed (forced; rebind; collector ok)` or `renewed (rebind; collector auth_required …)`, then update `ACCOUNT_LABEL` and the binding. The healthy collector loads a forced session on its next 5-minute poll.
 
+## Upgrading the refresher to v0.3.1
+
+v0.3.1 changes only the laptop-side refresher; the collector image and the native plugin stay at v0.3.0. On the refresher host:
+
+1. Copy `refresher/lib.ts` and `refresher/refresh-session.ts` over the installed copy (mode 600). Optionally install `refresher/examples/launch-browser-hyprland.sh` beside them (mode 700, owned by you), set its `id=` to the renewal browser's desktop entry, and check that entry's `--remote-debugging-port` matches `XQ_CDP_URL` ([starting the renewal browser](session-renewal.md#starting-the-renewal-browser)).
+2. Update the installed service from the example: `TimeoutStartSec=180`, `StateDirectory=xiaomi-session-refresh`, `StateDirectoryMode=0700`, and optionally `Environment=XQ_BROWSER_LAUNCH=<absolute path of the launcher>` and `Environment=XQ_NOTIFY=desktop`. The timer is unchanged.
+3. `systemctl --user daemon-reload`.
+4. Run `--check` with the unit's environment: it now also reports the renewal browser's readiness. Then the `--force` smoke run ([installation](session-renewal.md#installation)); with a launcher, quit the renewal browser first so the run proves the launch and the closing `Browser.close`.
+5. Healthy runs now write `browser_unavailable` while the renewal browser is neither running nor startable; the page shows that as an early warning.
+
+Rollback: restore the previous two files and unit, `systemctl --user daemon-reload`, and optionally delete `~/.local/state/xiaomi-session-refresh`. The status file format is unchanged in both directions.
+
 ## Rollback
 
 - **Plugin:** independent of the collector. The v0.2.1 plugin ignores the new snapshot fields; the v0.3.0 plugin shows legacy guidance for a v0.2.x collector.
-- **Refresher:** `systemctl --user disable --now xiaomi-session-refresh.timer`, delete its units and copy, and delete `<session dir>/renewal-status.json` on the collector host ([removal](session-renewal.md#installation)). A v0.3.0 collector then reports `renewal: null` within about 15 s. The page and `quota.fetch` fall back to the no-agent guidance with manual replacement, instead of pointing at the removed agent once its last report is 15 minutes old.
+- **Refresher:** `systemctl --user disable --now xiaomi-session-refresh.timer`, delete its units and copy (and its state directory `~/.local/state/xiaomi-session-refresh`, v0.3.1), and delete `<session dir>/renewal-status.json` on the collector host ([removal](session-renewal.md#installation)). A v0.3.0 collector then reports `renewal: null` within about 15 s. The page and `quota.fetch` fall back to the no-agent guidance with manual replacement, instead of pointing at the removed agent once its last report is 15 minutes old.
 - **Collector:** disable and remove the refresher first, including `renewal-status.json` as above (a v0.2.x collector does not reload pushed sessions; it ignores that file, but a later v0.3.0 collector would read a stale report). Redeploy the previous image digest, keeping the directory mount with `MIMO_COOKIE_FILE` at the file inside it (or restoring a single-file bind of that same, newest file); either way v0.2.x needs a restart after each replacement.
 - Never restore an older session file over a newer one; the newest valid session is the one to keep.
 
