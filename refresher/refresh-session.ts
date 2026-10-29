@@ -5,10 +5,17 @@ import { hostname } from "node:os";
 import {
   ConfigError,
   connectBrowser,
+  fileStateStore,
+  launcherRunner,
+  lockPath,
+  notifySend,
   parseArgs,
   parseConfig,
+  probeBrowser,
   runRefresh,
   spawnRunner,
+  stateDir,
+  takeRunLock,
 } from "./lib";
 
 const PREFIX = "xiaomi-session-refresh: ";
@@ -25,10 +32,22 @@ try {
   );
   process.exit(1);
 }
+const dir = stateDir(process.env);
+// One run at a time, timer or by hand; --check only reads and needs no lock.
+if (!flags.check) {
+  const lock = takeRunLock(lockPath(process.env, dir));
+  if (lock !== "held") {
+    console.error(
+      PREFIX + (lock === "busy" ? "busy (another run is in progress)" : "run lock unavailable"),
+    );
+    process.exit(1);
+  }
+}
 // SIGTERM (unit stop or start timeout), SIGINT and SIGHUP (terminal closed): the run closes its owned tab
 // and writes nothing more; exit 128+signal. The fallback exit waits out one
 // pending DevTools command (10 s) plus the tab close (2 s), so a tab whose
-// createTarget reply arrives after the signal is still closed.
+// createTarget reply arrives after the signal is still closed. Closing a browser
+// the run started is best effort inside the same window.
 const interrupt = new AbortController();
 let signalled = 0;
 const finish = (code: number): never => {
@@ -49,8 +68,12 @@ for (const [name, code] of [
 const outcome = await runRefresh(config, flags, {
   ssh: spawnRunner(),
   connectBrowser: (origin, timeoutMs) => connectBrowser(origin, { timeoutMs }),
+  probe: (origin, timeoutMs) => probeBrowser(origin, timeoutMs, { signal: interrupt.signal }),
   fetch: (input, init) => fetch(input, init),
   now: () => new Date(),
+  ...(config.browserLaunch ? { launcher: launcherRunner(config.browserLaunch) } : {}),
+  ...(config.notify === "desktop" ? { notify: notifySend() } : {}),
+  state: fileStateStore(dir),
   signal: interrupt.signal,
 });
 if (signalled) finish(signalled);
